@@ -1,0 +1,1995 @@
+/**
+ * Azahar Web UI — azahar_ui.js
+ * Loads the Azahar WebAssembly module and provides the emulator UI.
+ */
+
+(function () {
+    'use strict';
+
+    // ── DOM refs ──────────────────────────────────────────────────
+    const webConfig = window.AzaharWebConfig || {};
+    const isWebGL2Artifact = webConfig.renderer === 'webgl2';
+    const artifactName = webConfig.artifact || (isWebGL2Artifact ? 'azahar_webgl2' : 'azahar');
+    const softwareFallbackUrl = webConfig.softwareFallbackUrl || 'index.html';
+    const autoStart = new URLSearchParams(location.search).get('autostart') !== '0';
+    const explicitWebGL2 = new URLSearchParams(location.search).get('renderer') === 'webgl2';
+    const canvas = document.getElementById('canvas');
+    // The startup presentation guard reads pixels until the first visible
+    // game frame arrives.  Request a readback-oriented 2D context once,
+    // before Emscripten initializes SDL's software canvas, rather than
+    // repeatedly creating an unhinted context in the run loop.
+    // A canvas can hold either a 2D or WebGL context, never both. The stable
+    // page claims its 2D software canvas here; the separately bootstrapped
+    // WebGL2 page intentionally leaves it untouched until SDL creates GLES 3.
+    const canvas2dContext = isWebGL2Artifact ? null :
+        canvas.getContext('2d', {willReadFrequently: true});
+    const romInput = document.getElementById('rom-file');
+    const fileLabel = document.getElementById('file-label');
+    const btnLoad = document.getElementById('btn-load');
+    const btnInit = document.getElementById('btn-init');
+    const btnStep = document.getElementById('btn-step');
+    const btnRun = document.getElementById('btn-run');
+    const btnStop = document.getElementById('btn-stop');
+    const btnSound = document.getElementById('btn-sound');
+    const statusEl = document.getElementById('status');
+    const progressEl = document.getElementById('progress');
+    const fpsEl = document.getElementById('fps');
+    const logEl = document.getElementById('log');
+    // The adapter string keys the remembered verdict, so a result measured on
+    // one GPU/driver never suppresses the accelerated path on another. A
+    // Windows D3D11 or Vulkan machine therefore keeps its own answer.
+    let webglAdapter = '';
+    const RENDERER_VERDICT_KEY = 'azahar-renderer-verdict';
+    // Version 2: the engine stopped stalling ANGLE Metal (streamed uploads now
+    // orphan their buffers), so software verdicts measured before are stale.
+    // Version 3: the measurement mistook shader-compilation stalls on loading
+    // screens (Smash Bros. starting a battle) for a slow GPU, pinning capable
+    // machines to the much slower software renderer; earlier verdicts are void.
+    const RENDERER_VERDICT_VERSION = 3;
+
+    function readRendererVerdict() {
+        try {
+            const stored = JSON.parse(localStorage.getItem(RENDERER_VERDICT_KEY) || 'null');
+            if (!stored || stored.v !== RENDERER_VERDICT_VERSION) return null;
+            return stored;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function storeRendererVerdict(entry) {
+        try {
+            localStorage.setItem(RENDERER_VERDICT_KEY, JSON.stringify({
+                v: RENDERER_VERDICT_VERSION,
+                adapter: webglAdapter || 'masked/unknown',
+                at: Date.now(),
+                ...entry,
+            }));
+        } catch (_) {}
+    }
+
+    function clearRendererVerdict() {
+        try {
+            localStorage.removeItem(RENDERER_VERDICT_KEY);
+        } catch (_) {}
+    }
+
+    // An accelerated backend can be slower than the software renderer without
+    // ever failing: some drivers stall frame production instead of rejecting
+    // work, which caps emulation at the frame rate rather than at the CPU.
+    // `?autoFallback=0` pins the selected renderer for measurement.
+    const autoFallbackEnabled =
+        new URLSearchParams(location.search).get('autoFallback') !== '0';
+    // Only Auto re-picks a backend. Choosing "Accelerated (WebGL2)" in the
+    // dropdown is a decision to run that backend, including where it is slow,
+    // so throughput never overrides it; the hard-failure fallbacks above still
+    // apply to both because a backend that cannot present is not a choice.
+    const throughputFallbackAllowed = autoFallbackEnabled && !explicitWebGL2;
+    const throughputWindowMs = 8000;
+    // Scene loads and the first frames after a title screen briefly starve the
+    // callback rate on a backend that is otherwise keeping up. Only a run of
+    // consecutive bad samples is evidence of a sustained limit, so the switch
+    // needs ~15 s of them rather than one unlucky half-second. Samples taken
+    // while the GPU builds new shaders (and for a few seconds after) say nothing
+    // about steady speed and do not count: the browser compiles them in the GPU
+    // process, which delays frames without loading the page.
+    const throughputBadSamplesRequired = 30;
+    const shaderQuietMs = 3000;
+    let throughputBadSamples = 0;
+    let shaderBuildCount = -1;
+    let shaderBuildAt = 0;
+
+    const rendererMode = document.getElementById('renderer-mode');
+    const rendererModeHelp = document.getElementById('renderer-mode-help');
+    const rendererRemeasure = document.getElementById('renderer-remeasure');
+    const resolutionScale = document.getElementById('resolution-scale');
+    const resolutionScaleHelp = document.getElementById('resolution-scale-help');
+    const softwareDetail = document.getElementById('software-detail');
+    const saveStateSlot = document.getElementById('save-state-slot');
+    const btnSaveState = document.getElementById('btn-save-state');
+    const saveStorageInfo = document.getElementById('save-storage-info');
+    const saveStateStatus = document.getElementById('save-state-status');
+    const saveStateList = document.getElementById('save-state-list');
+    const fastForward = document.getElementById('fast-forward');
+    const fastForwardValue = document.getElementById('fast-forward-value');
+
+    // ── State ─────────────────────────────────────────────────────
+    let wasmModule = null;
+    let romData = null;
+    // Keep only a disk-backed source (or the library URL) for renderer recovery.
+    // The mounted ROM itself may have been released from romData already.
+    let romRecoveryFile = null;
+    let romRecoveryUrl = '';
+    let romMounted = false;
+    let romName = '';
+    let romPath = '/rom.bin';
+    let initialized = false;
+    let initializing = null;
+    let romLoaded = false;
+    // The native core cannot load a second title into the same WebAssembly
+    // instance: a repeated azahar_load_rom traps ("unreachable" / "memory
+    // access out of bounds"). Once a load was attempted, another title needs
+    // a fresh page session.
+    let coreUsed = false;
+    let running = false;
+    let runAnimationFrame = null;
+    let frameCount = 0;
+    let runStartedAt = 0;
+    let nextBootStatusAt = 0;
+    let rendererGraphicsDetected = false;
+    let gameGraphicsDetected = false;
+    let lastFpsAt = 0;
+    let lastFrameCount = 0;
+    let displayFps = 0;
+    let emulationSpeed = 0;
+    // Display-path throughput accounting. `stepWorkMs` is the time actually
+    // spent emulating, so it separates "the browser delivers few frames" from
+    // "each frame is expensive", which need opposite remedies.
+    let stepWorkMs = 0;
+    let stepWorkFrames = 0;
+    // Fits each callback's emulation to the display's refresh period. When the core
+    // uses its whole budget (the scene is CPU-bound), the budget grows until the
+    // callback nearly fills its refreshes: a fixed 14 ms left ~15% of a 60 Hz frame
+    // idle. It shrinks again when a callback would run into the next refresh.
+    // High-refresh displays (120 Hz and up) get one callback per refresh, so the
+    // page presents at the display's rate. A scene that cannot keep full speed that
+    // way spans 1/60 s of refreshes per callback instead: each callback has fixed
+    // presentation costs, and the game itself never draws more than 60 frames/s.
+    // Single refreshes are retried later, waiting longer after each failed retry.
+    // `?frameBudget=refresh` always uses one refresh, `?frameBudget=60hz` always
+    // spans 1/60 s, and `?frameBudget=fixed` keeps 14 ms everywhere.
+    const FRAME_BUDGET_MARGIN_MS = 1.5;
+    // A callback this short ends before the next refresh even at 240 Hz, so the gap
+    // after it is one refresh period. Without these probes a CPU-bound scene on a
+    // 120 Hz display would only ever show 16.7 ms gaps and look like a 60 Hz one.
+    const FRAME_BUDGET_PROBE_MS = 1;
+    const FRAME_BUDGET_PROBE_EVERY = 600;
+    // Guest speed is measured over this window; below SLOW twice in a row is slow.
+    const FRAME_BUDGET_SPEED_WINDOW_MS = 1000;
+    const FRAME_BUDGET_SLOW = 0.95;
+    // A spanned scene first retries single refreshes after this long.
+    const FRAME_BUDGET_RETRY_MS = 3000;
+    const frameBudgetMode = new URLSearchParams(location.search).get('frameBudget');
+    const frameBudget = {
+        enabled: frameBudgetMode !== 'fixed',
+        span: frameBudgetMode === 'refresh' || frameBudgetMode === '60hz' ? frameBudgetMode : 'auto',
+        budgetMs: 14, appliedMs: 14, lastAt: 0, intervals: [], periodMs: 1000 / 60, refreshes: 0,
+        callbacks: 0, probeStage: 0, probeGapMs: Infinity,
+        spanned: false, spanChangedAt: 0, retryMs: FRAME_BUDGET_RETRY_MS, overheadMs: 0,
+        speedBuffer: 0, speedAt: 0, speedGuestUs: 0, speed: 1, slowWindows: 0,
+    };
+    let gameGraphicsAt = 0;
+    let saveStateStore = null;
+    let saveStateBusy = false;
+    let lanSaveSync = null;
+    let lanSyncStatus = '';
+    let currentProgramId = '';
+    const saveStateDirectory = '/home/web_user/.local/share/azahar-emu/states';
+    const resolutionQuery = new URLSearchParams(location.search).get('resolution');
+    let selectedResolutionScale = Number.parseInt(resolutionQuery || '', 10);
+    if (!Number.isInteger(selectedResolutionScale)) {
+        try {
+            selectedResolutionScale = Number.parseInt(localStorage.getItem('azahar-resolution-scale') || '1', 10);
+        } catch (_) {
+            selectedResolutionScale = 1;
+        }
+    }
+    selectedResolutionScale = Math.max(1, Math.min(4, selectedResolutionScale || 1));
+    // Software renderer detail: 1 shades every pixel, 3 shades one sample
+    // per 3x3 block (faster, but blocky textures and text).
+    let selectedSoftwarePixelScale = Number.parseInt(
+        new URLSearchParams(location.search).get('swDetail') || '', 10);
+    if (!Number.isInteger(selectedSoftwarePixelScale)) {
+        try {
+            selectedSoftwarePixelScale = Number.parseInt(
+                localStorage.getItem('azahar-software-pixel-scale') || '1', 10);
+        } catch (_) {
+            selectedSoftwarePixelScale = 1;
+        }
+    }
+    selectedSoftwarePixelScale = selectedSoftwarePixelScale === 3 ? 3 : 1;
+    const fastForwardQuery = new URLSearchParams(location.search).get('speed');
+    let selectedFastForward = Number.parseInt(fastForwardQuery || '', 10);
+    if (!Number.isInteger(selectedFastForward)) {
+        try {
+            selectedFastForward = Number.parseInt(localStorage.getItem('azahar-fast-forward') || '1', 10);
+        } catch (_) {
+            selectedFastForward = 1;
+        }
+    }
+    selectedFastForward = Math.max(1, Math.min(4, selectedFastForward || 1));
+
+    function updateResolutionHelp() {
+        if (!resolutionScaleHelp) return;
+        if (!isWebGL2Artifact) {
+            resolutionScaleHelp.textContent =
+                'Software compatibility mode renders at 1x native resolution.';
+            return;
+        }
+        resolutionScaleHelp.textContent = selectedResolutionScale === 1 ?
+            'Native internal resolution preserves maximum emulation speed.' :
+            `${selectedResolutionScale}x supersampling improves 3D edges and detail but increases GPU work.`;
+    }
+
+    function applyResolutionScale() {
+        if (!initialized || !wasmModule?._azahar_set_resolution_scale || !isWebGL2Artifact) return;
+        const applied = wasmModule._azahar_set_resolution_scale(selectedResolutionScale);
+        if (applied !== selectedResolutionScale) {
+            log(`Resolution ${selectedResolutionScale}x rejected (native result ${applied}).`);
+            return;
+        }
+        log(`Internal resolution set to ${applied}x.`);
+    }
+
+    function applySoftwarePixelScale() {
+        if (!initialized || !wasmModule?._azahar_set_software_pixel_scale || isWebGL2Artifact) return;
+        const applied = wasmModule._azahar_set_software_pixel_scale(selectedSoftwarePixelScale);
+        log(applied === 1 ? 'Software detail: full.' : 'Software detail: fast (3x3 blocks).');
+    }
+
+    function applyFastForward() {
+        if (!initialized || !wasmModule?._azahar_set_fast_forward) return;
+        const applied = wasmModule._azahar_set_fast_forward(selectedFastForward);
+        if (applied !== selectedFastForward) {
+            log(`Fast-forward ${selectedFastForward}x rejected (${applied}).`);
+            return;
+        }
+        log(`Fast-forward set to ${applied}x.`);
+    }
+
+    // Renderer changes require a fresh document because a browser canvas may
+    // own either a 2D or WebGL context, never both. Keep both builds behind a
+    // single deployment page and make that required reload explicit.
+    if (rendererMode) {
+        const query = new URLSearchParams(location.search);
+        // An automatic fallback lands on `renderer=software`, but the mode the
+        // user selected is still Auto. Showing "Compatibility" there would
+        // misreport their setting and make the switch look manual.
+        rendererMode.value = query.has('webgl2-fallback') ?
+            'auto' : (query.get('renderer') || 'auto');
+        if (!rendererMode.options[rendererMode.selectedIndex]) rendererMode.value = 'auto';
+        const remembered = readRendererVerdict();
+        if (isWebGL2Artifact) {
+            rendererModeHelp.textContent = explicitWebGL2 ?
+                'Active: accelerated WebGL2, pinned by your choice. Auto would switch ' +
+                'if this GPU path measured slower.' :
+                'Active: accelerated WebGL2. Auto switches if this GPU path fails or ' +
+                'cannot keep up.';
+        } else if (remembered && remembered.verdict === 'software') {
+            // Say what was measured, not just that something happened: the
+            // accelerated option is still selectable and this is the evidence
+            // for leaving it alone.
+            rendererModeHelp.textContent =
+                `Active: compatibility renderer — fastest measured on this GPU ` +
+                `(${remembered.adapter}). Accelerated gave ${remembered.fps} frames/s ` +
+                `at ${remembered.speed}% speed.`;
+        } else {
+            rendererModeHelp.textContent =
+                `Active: compatibility renderer${query.has('webgl2-fallback') ? ' (automatic fallback)' : ''}.`;
+        }
+        if (rendererRemeasure && remembered) {
+            rendererRemeasure.hidden = false;
+            rendererRemeasure.addEventListener('click', () => {
+                clearRendererVerdict();
+                const destination = new URL('index.html', location.href);
+                if (selectedResolutionScale !== 1) {
+                    destination.searchParams.set('resolution', String(selectedResolutionScale));
+                }
+                if (selectedFastForward !== 1) {
+                    destination.searchParams.set('speed', String(selectedFastForward));
+                }
+                if (!autoStart) destination.searchParams.set('autostart', '0');
+                location.assign(destination.toString());
+            });
+        }
+        rendererMode.addEventListener('change', () => {
+            // Picking a renderer by hand retires the remembered measurement:
+            // choosing Accelerated is a request to run it, and returning to
+            // Auto afterwards should measure again rather than replay an old
+            // verdict the user has just overridden.
+            if (rendererMode.value !== 'auto') clearRendererVerdict();
+            const destination = new URL('index.html', location.href);
+            if (rendererMode.value !== 'auto') {
+                destination.searchParams.set('renderer', rendererMode.value);
+            }
+            if (selectedResolutionScale !== 1) {
+                destination.searchParams.set('resolution', String(selectedResolutionScale));
+            }
+            if (selectedFastForward !== 1) {
+                destination.searchParams.set('speed', String(selectedFastForward));
+            }
+            if (!autoStart) destination.searchParams.set('autostart', '0');
+            location.assign(destination.toString());
+        });
+    }
+
+    if (resolutionScale) {
+        resolutionScale.value = String(selectedResolutionScale);
+        resolutionScale.disabled = !isWebGL2Artifact;
+        updateResolutionHelp();
+        resolutionScale.addEventListener('change', () => {
+            selectedResolutionScale = Number.parseInt(resolutionScale.value, 10) || 1;
+            try {
+                localStorage.setItem('azahar-resolution-scale', String(selectedResolutionScale));
+            } catch (_) {}
+            const currentUrl = new URL(location.href);
+            if (selectedResolutionScale === 1) {
+                currentUrl.searchParams.delete('resolution');
+            } else {
+                currentUrl.searchParams.set('resolution', String(selectedResolutionScale));
+            }
+            history.replaceState(null, '', currentUrl);
+            updateResolutionHelp();
+            applyResolutionScale();
+        });
+    }
+
+    if (softwareDetail) {
+        softwareDetail.value = String(selectedSoftwarePixelScale);
+        softwareDetail.disabled = isWebGL2Artifact;
+        softwareDetail.addEventListener('change', () => {
+            selectedSoftwarePixelScale = softwareDetail.value === '3' ? 3 : 1;
+            try {
+                localStorage.setItem('azahar-software-pixel-scale', String(selectedSoftwarePixelScale));
+            } catch (_) {}
+            applySoftwarePixelScale();
+        });
+    }
+
+    if (fastForward) {
+        fastForward.value = String(selectedFastForward);
+        fastForwardValue.textContent = `${selectedFastForward}x`;
+        fastForward.addEventListener('input', () => {
+            selectedFastForward = Number.parseInt(fastForward.value, 10) || 1;
+            fastForwardValue.textContent = `${selectedFastForward}x`;
+            try {
+                localStorage.setItem('azahar-fast-forward', String(selectedFastForward));
+            } catch (_) {}
+            const currentUrl = new URL(location.href);
+            if (selectedFastForward === 1) currentUrl.searchParams.delete('speed');
+            else currentUrl.searchParams.set('speed', String(selectedFastForward));
+            history.replaceState(null, '', currentUrl);
+            applyFastForward();
+        });
+    }
+
+    // ── Logging ───────────────────────────────────────────────────
+    // Appending to textContent copied the whole log and forced a layout per line, so a
+    // chatty session slowed down as its log grew (one Local Play host fell from 100% to
+    // 6% speed). Even a text node per line laid the page out on every frame while a game
+    // repeated a warning thousands of times a second (Smash Bros. character select ran
+    // at 64% speed, half of it in layout). Lines are therefore queued and written at
+    // most every LOG_FLUSH_MS, and a message repeated back to back (ignoring the core's
+    // timestamp) is counted instead of printed again. The view keeps about the newest
+    // LOG_VIEW_LINES; the full history is AzaharUI.getLog().
+    const LOG_VIEW_LINES = 5000;
+    const LOG_HISTORY_LINES = 50000;
+    const LOG_FLUSH_MS = 250;
+    const logHistory = [];
+    const logPending = [];
+    const logViewChunks = []; // line counts of the text nodes in the view, oldest first
+    let logViewLines = 0;
+    let logFlushPending = false;
+    let logRepeatKey = null;
+    let logRepeats = 0;
+    let logClockSecond = -1;
+    let logClockText = '';
+
+    function logTime() {
+        const now = Date.now();
+        const second = Math.floor(now / 1000);
+        if (second !== logClockSecond) {
+            logClockSecond = second;
+            logClockText = new Date(now).toLocaleTimeString();
+        }
+        return logClockText;
+    }
+
+    function pushLogLine(line) {
+        logHistory.push(line);
+        if (logHistory.length > LOG_HISTORY_LINES + 5000) logHistory.splice(0, 5000);
+        logPending.push(line);
+        if (logPending.length > LOG_VIEW_LINES) logPending.splice(0, logPending.length - LOG_VIEW_LINES);
+        if (!logFlushPending) {
+            logFlushPending = true;
+            setTimeout(flushLog, LOG_FLUSH_MS);
+        }
+    }
+
+    function flushLogRepeats() {
+        if (!logRepeats) return;
+        const count = logRepeats;
+        logRepeats = 0;
+        pushLogLine(`[${logTime()}] (the previous message repeated ${count} more time${count === 1 ? '' : 's'})\n`);
+    }
+
+    function flushLog() {
+        logFlushPending = false;
+        flushLogRepeats();
+        if (!logPending.length) return;
+        logEl.appendChild(document.createTextNode(logPending.join('')));
+        logViewChunks.push(logPending.length);
+        logViewLines += logPending.length;
+        logPending.length = 0;
+        while (logViewLines > LOG_VIEW_LINES && logViewChunks.length > 1) {
+            logViewLines -= logViewChunks.shift();
+            logEl.removeChild(logEl.firstChild);
+        }
+        logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function log(msg) {
+        // The core prefixes "[ 368.613250]"; repeats differ only there.
+        const key = String(msg).replace(/\[\s*\d+\.\d+\]/, '');
+        if (key === logRepeatKey) {
+            logRepeats++;
+            if (!logFlushPending) {
+                logFlushPending = true;
+                setTimeout(flushLog, LOG_FLUSH_MS);
+            }
+            return;
+        }
+        flushLogRepeats();
+        logRepeatKey = key;
+        pushLogLine(`[${logTime()}] ${msg}\n`);
+    }
+
+    // Writing even identical text replaces the node and lays the page out again.
+    function setStatus(msg, cls) {
+        if (statusEl.textContent !== msg) statusEl.textContent = msg;
+        if (statusEl.className !== (cls || '')) statusEl.className = cls || '';
+    }
+
+    function showProgress(value) {
+        progressEl.hidden = false;
+        if (value === null || value === undefined) {
+            progressEl.removeAttribute('value');
+        } else {
+            progressEl.value = Math.max(0, Math.min(100, value));
+        }
+    }
+
+    function hideProgress() {
+        progressEl.hidden = true;
+        progressEl.value = 0;
+    }
+
+    function yieldToBrowser() {
+        return new Promise(resolve => requestAnimationFrame(resolve));
+    }
+
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function formatBytes(bytes) {
+        if (bytes < 1024) return `${bytes} B`;
+        if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+        return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    }
+
+    function stateKey(programId, slot) {
+        return `${programId}:${slot}`;
+    }
+
+    function nativeStatePath(programId, slot) {
+        return `${saveStateDirectory}/${programId}.${String(slot).padStart(2, '0')}.cst`;
+    }
+
+    function inspectCst(bytes) {
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength < 256) {
+            throw new Error('Save file is incomplete');
+        }
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        if (view.getUint8(0) !== 0x43 || view.getUint8(1) !== 0x53 ||
+            view.getUint8(2) !== 0x54 || view.getUint8(3) !== 0x1b) {
+            throw new Error('Save file has an invalid CST header');
+        }
+        const low = view.getUint32(4, true);
+        const high = view.getUint32(8, true);
+        const programId = high.toString(16).padStart(8, '0') +
+            low.toString(16).padStart(8, '0');
+        const timestamp = Number(view.getBigUint64(32, true)) * 1000;
+        return {programId: programId.toUpperCase(), timestamp};
+    }
+
+    function readCurrentProgramId() {
+        if (!wasmModule?._azahar_get_program_id) return '';
+        const pointer = wasmModule._malloc(8);
+        try {
+            if (wasmModule._azahar_get_program_id(pointer, 2) !== 0) return '';
+            const view = new DataView(wasmModule.HEAPU8.buffer, pointer, 8);
+            const low = view.getUint32(0, true);
+            const high = view.getUint32(4, true);
+            return (high.toString(16).padStart(8, '0') +
+                low.toString(16).padStart(8, '0')).toUpperCase();
+        } finally {
+            wasmModule._free(pointer);
+        }
+    }
+
+    function setSaveStateMessage(message, isError = false) {
+        if (!saveStateStatus) return;
+        saveStateStatus.textContent = message;
+        saveStateStatus.style.color = isError ? '#ff6b6b' : '#8fcf9f';
+    }
+
+    function updateSaveControls() {
+        if (btnSaveState) btnSaveState.disabled = saveStateBusy || !romLoaded ||
+            !currentProgramId || !saveStateStore;
+        if (!saveStateList) return;
+        for (const button of saveStateList.querySelectorAll('button')) {
+            const matchesGame = button.closest('.save-entry')?.dataset.programId === currentProgramId;
+            button.disabled = saveStateBusy || (button.dataset.action === 'load' &&
+                (!romLoaded || !matchesGame));
+        }
+    }
+
+    function setSaveStateBusy(busy) {
+        saveStateBusy = busy;
+        if (saveStateSlot) saveStateSlot.disabled = busy;
+        updateSaveControls();
+    }
+
+    async function refreshSaveStateList() {
+        if (!saveStateStore || !saveStateList) return;
+        const records = await saveStateStore.list();
+        saveStateList.replaceChildren();
+        if (!records.length) {
+            const empty = document.createElement('div');
+            empty.className = 'save-empty';
+            empty.textContent = 'No browser saves yet.';
+            saveStateList.appendChild(empty);
+        }
+        const groups = new Map();
+        for (const record of records) {
+            let group = groups.get(record.programId);
+            if (!group) {
+                group = document.createElement('section');
+                group.className = 'save-game-group';
+                group.dataset.programId = record.programId;
+                const gameTitle = document.createElement('div');
+                gameTitle.className = 'save-game-title';
+                gameTitle.textContent = record.romName || 'Unknown game';
+                const gameId = document.createElement('div');
+                gameId.className = 'save-game-id';
+                gameId.textContent = `Title ID ${record.programId}`;
+                group.append(gameTitle, gameId);
+                groups.set(record.programId, group);
+                saveStateList.appendChild(group);
+            }
+            const entry = document.createElement('div');
+            entry.className = 'save-entry';
+            entry.dataset.stateKey = record.key;
+            entry.dataset.programId = record.programId;
+
+            const title = document.createElement('div');
+            title.className = 'save-entry-title';
+            title.textContent = `Slot ${record.slot}`;
+            const meta = document.createElement('div');
+            meta.className = 'save-entry-meta';
+            meta.textContent = `${formatBytes(record.size)} - ${new Date(record.savedAt).toLocaleString()}`;
+            const actions = document.createElement('div');
+            actions.className = 'save-actions';
+            const loadButton = document.createElement('button');
+            loadButton.className = 'btn btn-secondary';
+            loadButton.dataset.action = 'load';
+            loadButton.dataset.stateKey = record.key;
+            loadButton.textContent = 'Load';
+            const deleteButton = document.createElement('button');
+            deleteButton.className = 'btn btn-danger';
+            deleteButton.dataset.action = 'delete';
+            deleteButton.dataset.stateKey = record.key;
+            deleteButton.textContent = 'Delete';
+            actions.append(loadButton, deleteButton);
+            entry.append(title, meta, actions);
+            group.appendChild(entry);
+        }
+        const totalBytes = records.reduce((sum, record) => sum + record.size, 0);
+        const persistence = await saveStateStore.persistence();
+        const durability = persistence.persistent ? 'persistent storage granted' :
+            (persistence.supported ? 'standard browser storage' : 'browser-managed storage');
+        saveStorageInfo.textContent = `${records.length} save${records.length === 1 ? '' : 's'}, ` +
+            `${formatBytes(totalBytes)} total - ${durability}.` +
+            (lanSyncStatus ? ` ${lanSyncStatus}` : '');
+        updateSaveControls();
+    }
+
+    async function syncLanSaves() {
+        // Never swap records underneath a save or load in progress; the
+        // operation itself triggers a sync when it finishes.
+        if (!lanSaveSync || saveStateBusy) return;
+        try {
+            const result = await lanSaveSync.sync();
+            const time = new Date().toLocaleTimeString();
+            lanSyncStatus = `Shared on the network, synced ${time}.`;
+            const changes = [];
+            if (result.uploaded) changes.push(`${result.uploaded} sent`);
+            if (result.downloaded) changes.push(`${result.downloaded} received`);
+            if (result.deleted) changes.push(`${result.deleted} deleted`);
+            if (changes.length) log(`Network save sync: ${changes.join(', ')}.`);
+        } catch (error) {
+            lanSyncStatus = `Network sync failed: ${error.message}.`;
+        }
+        await refreshSaveStateList();
+    }
+
+    async function initializeLanSaveSync() {
+        if (!window.AzaharLanSaveSync) return;
+        lanSaveSync = await window.AzaharLanSaveSync.connect(saveStateStore);
+        if (!lanSaveSync) return;
+        const help = document.getElementById('save-state-help');
+        if (help) {
+            help.textContent = 'Saves are compressed by Azahar and shared with every browser that opens ' +
+                'this page from the same server. Load the matching ROM before restoring.';
+        }
+        await syncLanSaves();
+        window.setInterval(() => void syncLanSaves(), 20000);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') void syncLanSaves();
+        });
+    }
+
+    async function initializeSaveStateStorage() {
+        if (!window.AzaharSaveStateStore) {
+            saveStorageInfo.textContent = 'Persistent save storage is unavailable.';
+            return;
+        }
+        try {
+            saveStateStore = await window.AzaharSaveStateStore.open();
+            await refreshSaveStateList();
+            await initializeLanSaveSync();
+        } catch (error) {
+            saveStorageInfo.textContent = `Save storage unavailable: ${error.message}`;
+            setSaveStateMessage('Browser saves are disabled.', true);
+            log(`Save storage error: ${error.message}`);
+        }
+    }
+
+    async function stepForStateOperation() {
+        await yieldToBrowser();
+        frameCount++;
+        const result = wasmModule._azahar_step_frame();
+        if (result !== 0) throw new Error(`Emulator rejected save-state operation (${result})`);
+        updateCanvasFromWasm();
+    }
+
+    async function waitForNativeStateOperation(kind, path = null) {
+        const deadline = performance.now() + 30000;
+        let advanced = false;
+        while (performance.now() < deadline) {
+            if (!running) {
+                await stepForStateOperation();
+                advanced = true;
+            } else {
+                const before = frameCount;
+                await delay(25);
+                if (!running) {
+                    throw new Error(`Emulation stopped while ${kind} the state`);
+                }
+                advanced ||= frameCount > before;
+            }
+            const operation = wasmModule._azahar_get_state_operation?.();
+            if (operation === -1) throw new Error('Native state-operation acknowledgement is unavailable');
+            if (advanced && operation === 0) {
+                if (!path) return;
+                try {
+                    const stat = wasmModule.FS.stat(path);
+                    if (stat.size >= 256) return stat.size;
+                } catch (_) {}
+                throw new Error('Native save completed without producing a valid state file');
+            }
+            await delay(25);
+        }
+        throw new Error(`Timed out waiting for Azahar to finish ${kind}ing the state`);
+    }
+
+    async function saveCurrentState() {
+        if (saveStateBusy || !saveStateStore || !romLoaded || !currentProgramId) return;
+        const slot = Number.parseInt(saveStateSlot.value, 10);
+        setSaveStateBusy(true);
+        setSaveStateMessage(`Saving slot ${slot} (compressed)...`);
+        try {
+            await saveStateStore.requestPersistence();
+            wasmModule.FS.mkdirTree(saveStateDirectory);
+            const path = nativeStatePath(currentProgramId, slot);
+            try { wasmModule.FS.unlink(path); } catch (_) {}
+            const request = wasmModule._azahar_save_state(slot);
+            if (request !== 0) throw new Error(`Save request rejected (${request})`);
+            await waitForNativeStateOperation('sav', path);
+            const bytes = wasmModule.FS.readFile(path);
+            const header = inspectCst(bytes);
+            if (header.programId !== currentProgramId) {
+                throw new Error('Azahar returned a save for a different title');
+            }
+            const storedBytes = bytes.slice();
+            await saveStateStore.put({
+                key: stateKey(currentProgramId, slot),
+                programId: currentProgramId,
+                slot,
+                romName,
+                // Milliseconds, not the header's whole seconds: network sync
+                // orders saves by this, and a slot can be saved twice a second.
+                savedAt: Date.now(),
+                size: storedBytes.byteLength,
+                data: new Blob([storedBytes], {type: 'application/octet-stream'}),
+            });
+            // IndexedDB now owns the durable compressed copy. Removing the
+            // transient MEMFS file avoids retaining another ~20 MiB in the tab.
+            try { wasmModule.FS.unlink(path); } catch (_) {}
+            log(`Save slot ${slot} persisted for ${currentProgramId} (${formatBytes(storedBytes.byteLength)}).`);
+            await refreshSaveStateList();
+            setSaveStateMessage(`Saved slot ${slot} - ${formatBytes(storedBytes.byteLength)}.`);
+        } catch (error) {
+            setSaveStateMessage(`Save failed: ${error.message}`, true);
+            log(`Save-state error: ${error.message}`);
+        } finally {
+            setSaveStateBusy(false);
+        }
+        void syncLanSaves();
+    }
+
+    async function loadStoredState(key) {
+        if (saveStateBusy || !saveStateStore || !romLoaded) return;
+        setSaveStateBusy(true);
+        try {
+            const record = await saveStateStore.get(key);
+            if (!record) throw new Error('The selected save no longer exists');
+            if (record.programId !== currentProgramId) {
+                throw new Error('Load the matching ROM before restoring this save');
+            }
+            setSaveStateMessage(`Loading slot ${record.slot}...`);
+            const bytes = new Uint8Array(await record.data.arrayBuffer());
+            const header = inspectCst(bytes);
+            if (header.programId !== currentProgramId) throw new Error('Save belongs to another title');
+            wasmModule.FS.mkdirTree(saveStateDirectory);
+            const path = nativeStatePath(currentProgramId, record.slot);
+            wasmModule.FS.writeFile(path, bytes, {canOwn: true});
+            const request = wasmModule._azahar_load_state(record.slot);
+            if (request !== 0) throw new Error(`Load request rejected (${request})`);
+            await waitForNativeStateOperation('load');
+            setSaveStateMessage(`Loaded slot ${record.slot} - ${formatBytes(record.size)}.`);
+            log(`Loaded persistent save slot ${record.slot} for ${currentProgramId}.`);
+        } catch (error) {
+            setSaveStateMessage(`Load failed: ${error.message}`, true);
+            log(`Load-state error: ${error.message}`);
+        } finally {
+            setSaveStateBusy(false);
+        }
+    }
+
+    async function deleteStoredState(key) {
+        if (saveStateBusy || !saveStateStore) return;
+        const record = await saveStateStore.get(key);
+        if (!record) return refreshSaveStateList();
+        if (!window.confirm(`Delete ${record.romName || record.programId} slot ${record.slot}?`)) return;
+        setSaveStateBusy(true);
+        try {
+            await saveStateStore.delete(key);
+            if (record.programId === currentProgramId && wasmModule) {
+                try { wasmModule.FS.unlink(nativeStatePath(record.programId, record.slot)); } catch (_) {}
+            }
+            setSaveStateMessage(`Deleted slot ${record.slot}.`);
+            log(`Deleted persistent save ${key}.`);
+            await refreshSaveStateList();
+        } catch (error) {
+            setSaveStateMessage(`Delete failed: ${error.message}`, true);
+        } finally {
+            setSaveStateBusy(false);
+        }
+        void syncLanSaves();
+    }
+
+    btnSaveState?.addEventListener('click', () => void saveCurrentState());
+    saveStateList?.addEventListener('click', event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button || button.disabled) return;
+        if (button.dataset.action === 'load') void loadStoredState(button.dataset.stateKey);
+        if (button.dataset.action === 'delete') void deleteStoredState(button.dataset.stateKey);
+    });
+
+    let softwareFallbackStarted = false;
+    function restartInSoftware(reason) {
+        if (!isWebGL2Artifact || softwareFallbackStarted) return;
+        softwareFallbackStarted = true;
+        log(`WebGL2 fallback: ${reason}`);
+        // Stop first: stopping writes its own status, which used to replace
+        // this explanation with a bare "Stopped at step N".
+        if (running) stopRunning();
+        setStatus(`WebGL2 unavailable (${reason}). Restarting in software...`, 'error');
+        const destination = new URL(softwareFallbackUrl, window.location.href);
+        const currentUrl = new URL(window.location.href);
+        // Preserve harness/user-flow controls across the fresh-document
+        // renderer switch. In particular, losing autostart=0 would begin
+        // execution while an uploaded save state is still being installed.
+        for (const name of ['autostart', 'resolution', 'speed', 'scheduler', 'play']) {
+            if (currentUrl.searchParams.has(name)) {
+                destination.searchParams.set(name, currentUrl.searchParams.get(name));
+            }
+        }
+        destination.searchParams.set('webgl2-fallback', '1');
+        // Preserve the precise preflight/native failure across the required
+        // fresh-document fallback. This makes automated backend gates
+        // diagnostic without weakening the user-facing recovery path.
+        destination.searchParams.set('webgl2-fallback-reason', reason);
+        window.setTimeout(async () => {
+            if (romRecoveryUrl) {
+                destination.searchParams.set('play', romRecoveryUrl);
+            } else if (romRecoveryFile && window.AzaharLibrary?.cachePlayable) {
+                setStatus('Preparing ROM for compatibility renderer...', '');
+                const key = `local-file:${romName}:${romRecoveryFile.size}:${romRecoveryFile.lastModified || 0}`;
+                try {
+                    if (await window.AzaharLibrary.cachePlayable(key, romRecoveryFile, romName, romName)) {
+                        destination.searchParams.set('play', key);
+                    } else {
+                        log('ROM could not be stored for renderer recovery; choose the file again after restart.');
+                    }
+                } catch (error) {
+                    log(`ROM recovery storage failed: ${error.message}; choose the file again after restart.`);
+                }
+            }
+            // A fresh canvas is still required, even when storage is unavailable.
+            window.location.replace(destination.toString());
+        }, 0);
+    }
+
+    /**
+     * Fall back when the accelerated path is throughput-limited rather than
+     * broken.
+     *
+     * Emulation advances once per browser frame, so a backend that delivers
+     * few frames caps guest speed no matter how little work each frame costs.
+     * The duty cycle distinguishes the two causes: when the callback is idle
+     * most of the time, the CPU is not the limit and the software renderer,
+     * which needs no GPU-process work at all, runs faster. A busy callback
+     * means the opposite, and switching would make things worse.
+     */
+    // Shaders and programs the accelerated renderer has built so far (0 if unknown).
+    function rendererShaderBuilds() {
+        if (!wasmModule?._azahar_get_renderer_stats) return 0;
+        const pointer = wasmModule._malloc(10 * 8);
+        try {
+            if (wasmModule._azahar_get_renderer_stats(pointer, 10) !== 0) return 0;
+            const stats = new Float64Array(wasmModule.HEAPU8.buffer, pointer, 10);
+            return stats[0] === 2 ? stats[1] : 0;
+        } finally {
+            wasmModule._free(pointer);
+        }
+    }
+
+    function checkDisplayThroughput(now) {
+        if (!isWebGL2Artifact || softwareFallbackStarted || !throughputFallbackAllowed) return;
+        if (!gameGraphicsDetected || !gameGraphicsAt) return;
+        if (now - gameGraphicsAt < throughputWindowMs) return;
+        if (!stepWorkFrames || displayFps <= 0) return;
+        const builds = rendererShaderBuilds();
+        if (builds !== shaderBuildCount) {
+            shaderBuildCount = builds;
+            shaderBuildAt = now;
+            throughputBadSamples = 0;
+        }
+        if (now - shaderBuildAt < shaderQuietMs) return;
+        const dutyCycle = (stepWorkMs / stepWorkFrames) * displayFps / 1000;
+        if (displayFps >= 20 || dutyCycle >= 0.35 || emulationSpeed >= 60) {
+            throughputBadSamples = 0;
+            return;
+        }
+        if (++throughputBadSamples < throughputBadSamplesRequired) return;
+        const reason =
+            `accelerated path delivered ${displayFps.toFixed(1)} frames/s at ` +
+            `${(dutyCycle * 100).toFixed(0)}% duty cycle ` +
+            `(${emulationSpeed.toFixed(0)}% speed) over ` +
+            `${throughputBadSamples} consecutive samples`;
+        // Remember it so Auto does not repeat a ~14 s probe, and a second ROM
+        // upload, on every visit to a machine whose answer is already known.
+        storeRendererVerdict({
+            verdict: 'software', reason,
+            fps: Number(displayFps.toFixed(1)),
+            speed: Number(emulationSpeed.toFixed(0)),
+        });
+        restartInSoftware(reason);
+    }
+
+    function compileWebGL2Probe(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        const ok = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+        const logText = gl.getShaderInfoLog(shader) || '';
+        gl.deleteShader(shader);
+        return {ok, logText};
+    }
+
+    // Validate the exact baseline used by RendererWebGL2 on an isolated probe
+    // canvas. This does not touch #canvas, preserving the fresh-session
+    // software fallback if context or shader creation fails.
+    function preflightWebGL2() {
+        if (!isWebGL2Artifact) return true;
+        const probe = document.createElement('canvas');
+        const gl = probe.getContext('webgl2', {
+            alpha: false, antialias: false, depth: true, stencil: true,
+        });
+        if (!gl) {
+            restartInSoftware('WebGL2 context creation failed');
+            return false;
+        }
+        const debugRenderer = gl.getExtension('WEBGL_debug_renderer_info');
+        const renderer = debugRenderer ?
+            gl.getParameter(debugRenderer.UNMASKED_RENDERER_WEBGL) : '';
+        webglAdapter = renderer || 'masked/unknown';
+        log(`WebGL2 adapter: ${webglAdapter}`);
+        // Auto already measured this adapter and found the accelerated path
+        // slower. Act on that here, before the WebGL2 module is fetched, so the
+        // repeat visit costs a redirect instead of another timed probe.
+        const remembered = readRendererVerdict();
+        if (throughputFallbackAllowed && remembered &&
+            remembered.adapter === webglAdapter && remembered.verdict === 'software') {
+            restartInSoftware(`remembered result for this GPU: ${remembered.reason}`);
+            return false;
+        }
+        // ANGLE/D3D11 can spend about a minute synchronously translating the
+        // generated PICA vertex shaders. Keep the WebGL2 rasterizer and select
+        // its CPU-vertex path instead; this reaches gameplay in a few seconds
+        // and is faster than the full software renderer. Vulkan/native GL keep
+        // hardware vertices. `?hwShader=1` remains a diagnostic override.
+        const requestedMode = new URLSearchParams(location.search);
+        if (requestedMode.get('hwShader') !== '1' && /(?:direct3d|d3d11)/i.test(renderer)) {
+            const compatibleUrl = new URL(location.href);
+            compatibleUrl.searchParams.set('hwShader', '0');
+            history.replaceState(null, '', compatibleUrl);
+            log('ANGLE/D3D11 detected: using WebGL2 with CPU vertex translation.');
+            if (rendererModeHelp) {
+                rendererModeHelp.textContent =
+                    'Active: WebGL2 with the D3D11-compatible CPU vertex path.';
+            }
+        }
+        const vertex = compileWebGL2Probe(gl, gl.VERTEX_SHADER, `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 vert_position;
+void main() { gl_Position = vec4(vert_position, 0.0, 1.0); }`);
+        const fragment = compileWebGL2Probe(gl, gl.FRAGMENT_SHADER, `#version 300 es
+precision mediump float;
+out vec4 frag_color;
+void main() { frag_color = vec4(1.0); }`);
+        if (!vertex.ok || !fragment.ok) {
+            restartInSoftware(`GLSL ES 3.00 shader preflight failed: ${vertex.logText || fragment.logText}`);
+            return false;
+        }
+
+        // Context loss cannot safely become a 2D session in this document.
+        // Navigate before title loading so the stable page gets a new canvas.
+        canvas.addEventListener('webglcontextlost', event => {
+            event.preventDefault();
+            restartInSoftware('WebGL2 context lost');
+        }, {once: true});
+        return true;
+    }
+
+    function romSize(data) {
+        return data instanceof Blob ? data.size : data.length;
+    }
+
+    // ChromeOS picks files through Drive, USB, and Android/Linux mounts whose
+    // File references can stop being readable once the game starts, so picked
+    // ROMs are copied into browser storage first there. Elsewhere this starts
+    // only after a read actually failed. `?romStaging=0|1` overrides both.
+    const ROM_STAGING_KEY = 'azahar-rom-staging';
+    const isChromeOS = /\bCrOS\b/.test(navigator.userAgent) ||
+        navigator.userAgentData?.platform === 'Chrome OS';
+
+    function shouldStageRom() {
+        const forced = new URLSearchParams(location.search).get('romStaging');
+        if (forced === '0' || forced === '1') return forced === '1';
+        if (isChromeOS) return true;
+        try {
+            return localStorage.getItem(ROM_STAGING_KEY) === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function rememberRomStaging() {
+        try {
+            localStorage.setItem(ROM_STAGING_KEY, '1');
+        } catch (_) {}
+    }
+
+    function memfsRomPath(filename) {
+        // Loader::GetLoader uses an extension as a fallback when a container
+        // (notably CIA) cannot be identified from its header. Keep only the
+        // final, safe extension: browser filenames are untrusted input and
+        // need not become filesystem paths in MEMFS.
+        const match = /\.[a-z0-9]+$/i.exec(filename);
+        return `/rom${match ? match[0].toLowerCase() : '.bin'}`;
+    }
+
+    // ── File picker ───────────────────────────────────────────────
+    romInput.addEventListener('change', function (e) {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        romName = file.name;
+        romPath = memfsRomPath(romName);
+        fileLabel.textContent = `📄 ${romName} (${(file.size / 1024 / 1024).toFixed(1)} MB)`;
+
+        btnLoad.disabled = true;
+        // The File is disk-backed; it is mounted lazily at load time rather
+        // than copied into memory, so multi-GiB images need no browser heap.
+        Promise.resolve(file).then(async function (bytes) {
+            if (coreUsed) {
+                // Hand the picked file to a fresh session through the local
+                // game cache rather than reloading into the used core.
+                if (window.AzaharLibrary?.playInFreshSession) {
+                    await window.AzaharLibrary.playInFreshSession(
+                        `local-file:${file.name}:${file.size}:${file.lastModified}`, bytes, file.name, file.name);
+                    return;
+                }
+                throw new Error('Reload the page to load another game.');
+            }
+            romData = bytes;
+            romRecoveryFile = bytes;
+            romRecoveryUrl = '';
+            romMounted = false;
+            log(`File selected: ${romName} (${romData.size} bytes)`);
+            setStatus(initialized ? `ROM ready: ${romName}` :
+                `ROM ready; starting emulator...`, 'ok');
+            btnLoad.disabled = !initialized;
+            window.setTimeout(hideProgress, 250);
+        }).catch(function (err) {
+            hideProgress();
+            setStatus('Failed to read file!', 'error');
+            log(`ERROR: file read failed: ${err && err.message ? err.message : err}`);
+        });
+    });
+
+    // ── WASM Module Loading ──────────────────────────────────────
+    // Page start-up and a library play request (?play=) can both ask for the
+    // module. Injecting the Emscripten glue twice throws ("Identifier
+    // 'EmscriptenEH' has already been declared") and stalls start-up, so all
+    // callers share one load.
+    let wasmModuleLoad = null;
+
+    // The generated glue allocates its shared heap with a 4 GiB maximum. A
+    // shared WebAssembly memory reserves its maximum up front, which phones
+    // (iOS in particular) may refuse with a RangeError even though the
+    // emulator rarely grows past its initial 768 MiB. Only when that
+    // allocation fails, retry with smaller maximums; everywhere it succeeds
+    // the original constructor's result is returned unchanged.
+    function installSharedMemoryFallback() {
+        const NativeMemory = WebAssembly.Memory;
+        if (NativeMemory.azaharFallback) return;
+        const fallbackPages = [32768, 24576, 16384]; // 2 GiB, 1.5 GiB, 1 GiB
+        function Memory(descriptor) {
+            try {
+                return new NativeMemory(descriptor);
+            } catch (error) {
+                if (!descriptor?.shared || !descriptor.maximum) throw error;
+                for (const maximum of fallbackPages) {
+                    if (maximum >= descriptor.maximum || maximum < descriptor.initial) continue;
+                    try {
+                        const memory = new NativeMemory({...descriptor, maximum});
+                        log(`Shared memory with a ${descriptor.maximum / 16} MiB maximum was refused ` +
+                            `(${error}); using ${maximum / 16} MiB.`);
+                        return memory;
+                    } catch (_) { /* try the next size */ }
+                }
+                throw error;
+            }
+        }
+        Memory.prototype = NativeMemory.prototype;
+        Memory.azaharFallback = true;
+        WebAssembly.Memory = Memory;
+    }
+
+    function loadWasmModule() {
+        wasmModuleLoad ||= loadWasmModuleOnce().catch(error => {
+            wasmModuleLoad = null;
+            throw error;
+        });
+        return wasmModuleLoad;
+    }
+
+    async function loadWasmModuleOnce() {
+        await ensureCrossOriginIsolated();
+        if (!preflightWebGL2()) {
+            // restartInSoftware has scheduled a navigation to a fresh canvas.
+            return new Promise(() => {});
+        }
+        log(`Loading ${artifactName}.js glue script...`);
+        setStatus('Loading WebAssembly module...');
+
+        installSharedMemoryFallback();
+        return new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = `${artifactName}.js`;
+            // SDL2's Emscripten backend must use the UI canvas that already
+            // exists in the page. Set this before loading the generated glue
+            // script so it does not create an unbound canvas target.
+            window.Module = window.Module || {};
+            window.Module.canvas = canvas;
+            // Keep native frontend/core diagnostics visible in the browser UI.
+            // Emscripten invokes these hooks for stdout and stderr after the
+            // generated runtime starts, which lets real-ROM testing expose
+            // service/configuration failures instead of appearing as a
+            // permanently black canvas.
+            window.Module.print = function (message) {
+                log(`[native] ${message}`);
+            };
+            window.Module.printErr = function (message) {
+                log(`[native] ${message}`);
+            };
+            window.Module.setStatus = function (message) {
+                if (message) {
+                    showProgress(null);
+                    setStatus(`WASM: ${message}`);
+                }
+            };
+            script.onload = function () {
+                // Emscripten-generated Module object
+                if (typeof Module !== 'undefined') {
+                    Module['onRuntimeInitialized'] = function () {
+                        log('WebAssembly runtime initialized.');
+                        wasmModule = Module;
+                        setStatus('WASM ready. Starting emulator...', 'ok');
+                        resolve(Module);
+                    };
+                    // In case it's already initialized
+                    if (Module.calledRun) {
+                        log('WebAssembly already initialized.');
+                        wasmModule = Module;
+                        setStatus('WASM ready. Starting emulator...', 'ok');
+                        resolve(Module);
+                    }
+                } else {
+                    // If no Module object, script may be self-initializing
+                    log('Waiting for WASM runtime...');
+                    // Poll for Module
+                    const check = setInterval(() => {
+                        if (typeof Module !== 'undefined' && Module.calledRun) {
+                            clearInterval(check);
+                            wasmModule = Module;
+                            log('WebAssembly runtime detected.');
+                            setStatus('WASM ready. Starting emulator...', 'ok');
+                            resolve(Module);
+                        }
+                    }, 200);
+                    setTimeout(() => { clearInterval(check); reject(new Error('WASM timeout')); }, 30000);
+                }
+            };
+            script.onerror = function () {
+                reject(new Error('Failed to load azahar.js'));
+            };
+            document.head.appendChild(script);
+        });
+    }
+
+    async function ensureCrossOriginIsolated() {
+        if (window.crossOriginIsolated) {
+            try { sessionStorage.removeItem('azahar-coi-reload'); } catch (_) {}
+            return;
+        }
+
+        // GitHub Pages and other static hosts cannot set COOP/COEP headers.
+        // The local service worker can add them after one controlled reload.
+        const canUseServiceWorker = 'serviceWorker' in navigator &&
+            (window.location.protocol === 'https:' ||
+                window.location.hostname === 'localhost' ||
+                window.location.hostname === '127.0.0.1');
+        if (!canUseServiceWorker) {
+            throw new Error('This server is missing COOP/COEP headers. Use serve_web.bat or HTTPS with coi-serviceworker.js.');
+        }
+
+        let attemptedReload = false;
+        try { attemptedReload = sessionStorage.getItem('azahar-coi-reload') === '1'; } catch (_) {}
+        if (attemptedReload) {
+            throw new Error('Browser isolation is unavailable after reload. Serve web/ with COOP: same-origin and COEP: require-corp.');
+        }
+
+        try {
+            try { sessionStorage.setItem('azahar-coi-reload', '1'); } catch (_) {}
+            setStatus('Enabling threaded WebAssembly; reloading once...', 'ok');
+            showProgress(null);
+            await navigator.serviceWorker.register('coi-serviceworker.js', {scope: './'});
+            await navigator.serviceWorker.ready;
+            window.location.reload();
+            await new Promise(() => {});
+        } catch (error) {
+            throw new Error(`Unable to enable browser isolation: ${error.message}`);
+        }
+    }
+
+    // ── Initialize Emulator ──────────────────────────────────────
+    function initializeEmulator() {
+        if (initialized) return Promise.resolve();
+        // Concurrent callers (auto-init and a library play request) must all
+        // wait for the same initialization instead of racing past it.
+        if (!initializing) {
+            initializing = runInitializeEmulator().finally(() => { initializing = null; });
+        }
+        return initializing;
+    }
+
+    async function runInitializeEmulator() {
+        btnInit.disabled = true;
+        showProgress(null);
+        setStatus('Initializing emulator...');
+
+        try {
+            if (!wasmModule) await loadWasmModule();
+            await yieldToBrowser();
+            const result = wasmModule._azahar_init();
+            // Apply saved buffer and stretching choices before a title loads.
+            window.AzaharAudio?.bindModule(wasmModule);
+            if (result !== 0) {
+                if (isWebGL2Artifact && result === -7) {
+                    restartInSoftware('native WebGL2 context setup failed');
+                    return;
+                }
+                setStatus(`Init failed (code ${result})`, 'error');
+                log(`ERROR: azahar_init returned ${result}`);
+                btnInit.disabled = false;
+                return;
+            }
+            initialized = true;
+            applyResolutionScale();
+            applySoftwarePixelScale();
+            applyFastForward();
+            window.dispatchEvent(new Event('azahar-initialized'));
+            log('Emulator initialized successfully.');
+            hideProgress();
+            setStatus('Emulator ready. Choose a ROM to load and run.', 'ok');
+            if (romData) btnLoad.disabled = false;
+        } catch (err) {
+            hideProgress();
+            setStatus(`Init error: ${err.message}`, 'error');
+            log(`ERROR: ${err.message}`);
+            btnInit.disabled = false;
+        }
+    }
+
+    btnInit.addEventListener('click', function () {
+        void initializeEmulator();
+    });
+
+    // ── Load ROM ─────────────────────────────────────────────────
+    async function loadAndRunRom() {
+        if (!initialized || (!romData && !romMounted)) {
+            setStatus('Initialize emulator and select a ROM first.', 'error');
+            return;
+        }
+        if (coreUsed && romData) {
+            setStatus('Another title was already loaded. Reload the page to start a new game.', 'error');
+            btnLoad.disabled = true;
+            return;
+        }
+
+        try {
+            setStatus('Mounting ROM...');
+            showProgress(null);
+            btnLoad.disabled = true;
+            await yieldToBrowser();
+
+            // Expose the ROM to the C++ side at romPath. Preserve the
+            // selected extension because the native loader uses it as a
+            // fallback for encrypted CIA containers. Retail images reach
+            // 2-4 GiB, more than one ArrayBuffer can hold next to the
+            // emulator heap, so Files and Blobs are mounted lazily and read
+            // on demand. In-memory bytes (RAR extraction) go to MEMFS, which
+            // takes ownership to avoid a second copy.
+            if (romData) {
+                if (romData instanceof Blob && window.AzaharRomFS) {
+                    try {
+                        await window.AzaharRomFS.mount(wasmModule.FS, romPath, romData, {
+                            preferStaged: shouldStageRom(),
+                            onProgress: fraction => {
+                                setStatus(`Copying ROM into browser storage (${Math.round(fraction * 100)}%)...`);
+                                showProgress(fraction * 100);
+                            },
+                        });
+                        log(`ROM mounted lazily: ${romPath} (${romData.size} bytes` +
+                            `${window.AzaharRomFS.isStaged?.(romPath) ? ', staged copy for this browser' : ''})`);
+                    } catch (mountErr) {
+                        if (romData.size <= 512 * 1024 * 1024) {
+                            log(`WARN: Lazy mount failed (${mountErr.message}); falling back to in-memory copy...`);
+                            setStatus('Copying ROM into memory...');
+                            showProgress(null);
+                            const buffer = await romData.arrayBuffer();
+                            wasmModule.FS.writeFile(romPath, new Uint8Array(buffer), { canOwn: true });
+                            log(`ROM written to MEMFS: ${romPath}`);
+                        } else {
+                            throw mountErr;
+                        }
+                    }
+                } else {
+                    wasmModule.FS.writeFile(romPath, romData, {canOwn: true});
+                    log(`ROM written to MEMFS: ${romPath}`);
+                }
+                romData = null;
+                romMounted = true;
+            }
+
+            setStatus('Opening game...');
+            await yieldToBrowser();
+            coreUsed = true;
+            const result = wasmModule.ccall('azahar_load_rom', 'number', ['string'], [romPath]);
+            if (result === 0) {
+                romLoaded = true;
+                // The engine's audio ring exists from init; start draining it
+                // now that the title will produce sound.
+                void window.AzaharAudio?.attach(wasmModule).then(attached => {
+                    if (attached) log('Game audio started.');
+                });
+                currentProgramId = readCurrentProgramId();
+                if (!currentProgramId) {
+                    log('WARNING: Could not determine the loaded title ID; browser saves are disabled.');
+                    setSaveStateMessage('Could not identify this title for browser saves.', true);
+                }
+                updateSaveControls();
+                if (saveStateStore) void refreshSaveStateList();
+                log('ROM loaded successfully!');
+                hideProgress();
+                if (autoStart) {
+                    btnStep.disabled = true;
+                    startRunning();
+                } else {
+                    btnStep.disabled = false;
+                    btnRun.disabled = false;
+                    setStatus('ROM loaded successfully. Ready to run.', 'ok');
+                }
+            } else if (isWebGL2Artifact && result === -7) {
+                hideProgress();
+                restartInSoftware('native GLSL ES 3.00 setup failed');
+            } else if (result === -8) {
+                hideProgress();
+                setStatus('ROM is encrypted. Use a decrypted dump with your own keys.', 'error');
+                log('ERROR: azahar_load_rom rejected an encrypted ROM');
+                btnLoad.disabled = false;
+            } else if (result === -4) {
+                hideProgress();
+                setStatus('ROM file could not be opened from browser storage.', 'error');
+                log('ERROR: azahar_load_rom could not open the mounted ROM path');
+                btnLoad.disabled = false;
+            } else {
+                hideProgress();
+                setStatus(`ROM load failed (code ${result})`, 'error');
+                log(`ERROR: azahar_load_rom returned ${result}`);
+                btnLoad.disabled = false;
+            }
+        } catch (err) {
+            hideProgress();
+            setStatus(`Load error: ${err.message}`, 'error');
+            log(`ERROR: ${err.message}`);
+            btnLoad.disabled = false;
+        }
+    }
+
+    btnLoad.addEventListener('click', function () {
+        void loadAndRunRom();
+    });
+
+    // ── Step One Frame ───────────────────────────────────────────
+    btnStep.addEventListener('click', function () {
+        if (!romLoaded) {
+            setStatus('Load a ROM first.', 'error');
+            return;
+        }
+
+        try {
+            frameCount++;
+            const result = wasmModule._azahar_step_frame();
+
+            if (result === 0) {
+                // Copy the Emscripten GL/Canvas framebuffer to our canvas
+                // SDL2 in Emscripten renders to the default canvas; we grab it
+                updateCanvasFromWasm();
+                setStatus(`Frame ${frameCount} OK`, 'ok');
+            } else if (result === 1) {
+                log('Emulator requested shutdown.');
+                stopRunning('Emulation ended (shutdown)', 'error');
+            } else {
+                setStatus(`Frame step error (code ${result})`, 'error');
+                log(`ERROR: azahar_step_frame returned ${result}`);
+            }
+        } catch (err) {
+            setStatus(`Step error: ${err.message}`, 'error');
+            log(`ERROR: ${err.message}`);
+        }
+    });
+
+    // ── Run Loop ─────────────────────────────────────────────────
+    function visibleCanvasPixels() {
+        if (canvas2dContext) {
+            return canvas2dContext.getImageData(0, 0, canvas.width, canvas.height).data;
+        }
+        // This runs only after the WebGL2 renderer has claimed the canvas.
+        // Asking for its existing context is safe; creating a 2D context here
+        // would make the experimental fallback contract impossible.
+        const gl = canvas.getContext('webgl2');
+        if (!gl) return null;
+        try {
+            const pixels = new Uint8Array(canvas.width * canvas.height * 4);
+            gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+            return pixels;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function updateBootStatus(now) {
+        if (now < nextBootStatusAt) return;
+        nextBootStatusAt = now + 500;
+        if (!rendererGraphicsDetected && wasmModule._azahar_framebuffer_nonblack_pixels) {
+            const framebufferPixels = wasmModule._azahar_framebuffer_nonblack_pixels();
+            // WebGL2 can keep the framebuffer GPU-resident, so it deliberately
+            // reports -2 rather than exposing an unsynchronized CPU vector.
+            // Continue to the existing compositor readback gate in that case.
+            rendererGraphicsDetected = framebufferPixels > 0 ||
+                (isWebGL2Artifact && framebufferPixels === -2);
+        }
+        if (rendererGraphicsDetected && !gameGraphicsDetected) {
+            // A non-black software framebuffer proves only that emulation and
+            // rasterization work. Confirm that those pixels arrived at the
+            // visible UI canvas before reporting graphics as detected.
+            const data = visibleCanvasPixels();
+            if (data) {
+                const colors = new Set();
+                let nonBlackSamples = 0;
+                for (let index = 0; index < data.length; index += 64) {
+                    const red = data[index];
+                    const green = data[index + 1];
+                    const blue = data[index + 2];
+                    if (red || green || blue) {
+                        nonBlackSamples++;
+                        colors.add(`${red},${green},${blue}`);
+                    }
+                }
+                gameGraphicsDetected = nonBlackSamples >= 16 && colors.size >= 2;
+                if (gameGraphicsDetected) gameGraphicsAt = now;
+            }
+        }
+        if (gameGraphicsDetected) {
+            hideProgress();
+            setStatus(`Running. Visible game graphics detected after ${((now - runStartedAt) / 1000).toFixed(1)}s`, 'ok');
+        } else if (rendererGraphicsDetected) {
+            // A context and shader preflight are not enough: an experimental
+            // backend can still fail to put its drawing buffer on the browser
+            // compositor. Recover into the stable artifact rather than
+            // leaving the user at a black screen.
+            const presentationTimeout = explicitWebGL2 ? 90000 : 10000;
+            if (isWebGL2Artifact && now - runStartedAt >= presentationTimeout) {
+                restartInSoftware('WebGL2 presentation produced no visible frame');
+                return;
+            }
+            showProgress(null);
+            setStatus(`Renderer graphics ready; waiting for canvas presentation... ${((now - runStartedAt) / 1000).toFixed(1)}s`, 'ok');
+        } else {
+            showProgress(null);
+            setStatus(`Booting game... ${((now - runStartedAt) / 1000).toFixed(1)}s (step ${frameCount})`, 'ok');
+        }
+    }
+
+    // ── Adaptive CPU clock ───────────────────────────────────────
+    // Emulated time only advances by executing instructions, so a game thread that
+    // spins while it waits costs as much as real work: Fire Emblem: Awakening's movies
+    // gave 97% of the emulated CPU to such a thread and ran at 33% speed. While the
+    // browser cannot keep up, the emulated clock is lowered as long as the game keeps
+    // its frame rate in emulated time (the movies then run at full speed and 30 FPS),
+    // and restored as soon as the game drops frames, the scene changes, or the browser
+    // keeps up again. `?cpuClock=N` pins the clock; `?adaptiveClock=0` disables this.
+    const CPU_CLOCK_MIN = 25;
+    const cpuClockQuery = new URLSearchParams(location.search);
+    const cpuClock = {
+        enabled: !cpuClockQuery.has('cpuClock') && cpuClockQuery.get('adaptiveClock') !== '0',
+        percent: 100, slowSamples: 0, fastSamples: 0, pending: null, refFps: 0,
+        ceiling: 100, ceilingUntil: 0, changes: 0,
+    };
+
+    function setCpuClock(percent) {
+        if (percent === cpuClock.percent) return;
+        cpuClock.percent = wasmModule._azahar_set_cpu_clock(percent);
+        cpuClock.changes++;
+        if (cpuClock.percent === 100) cpuClock.refFps = 0;
+    }
+
+    // Called with each FPS sample (every ~500 ms) at 1x speed.
+    function tuneCpuClock(now, gameFps, speed) {
+        if (!cpuClock.enabled || !wasmModule._azahar_set_cpu_clock) return;
+        // Speed deficits are intended while fast-forwarding or while Local Play paces
+        // this console; leave the clock alone then.
+        if (selectedFastForward !== 1 || (window.AzaharNetplay?.speedPermille ?? 1000) < 1000) {
+            setCpuClock(100);
+            return;
+        }
+        if (!(speed > 0) || !(gameFps > 0)) return;
+        const guestFps = gameFps / (speed / 100);
+        // Judge a lowered clock once it has settled: the game must keep its frame rate.
+        if (cpuClock.pending) {
+            if (now < cpuClock.pending.judgeAt) return;
+            const {from, refFps} = cpuClock.pending;
+            // One low sample can be the switch itself; judge on two in a row.
+            if (guestFps < refFps * 0.93 && !cpuClock.pending.lowOnce) {
+                cpuClock.pending.lowOnce = true;
+                return;
+            }
+            cpuClock.pending = null;
+            if (guestFps < refFps * 0.93) {
+                // The game needed those cycles: go back, and remember that this clock is too
+                // low for a while (longer each time no clock in between is left to try).
+                const tried = cpuClock.percent;
+                setCpuClock(from);
+                cpuClock.failed = Math.max(now < (cpuClock.failedUntil || 0) ? cpuClock.failed : 0, tried);
+                if (from - cpuClock.failed <= 5) cpuClock.failures = (cpuClock.failures || 0) + 1;
+                cpuClock.failedUntil = now + 30000 * 2 ** Math.min(4, cpuClock.failures || 0);
+                return;
+            }
+            cpuClock.refFps = refFps;
+        }
+        if (cpuClock.percent < 100 && cpuClock.refFps &&
+            Math.abs(guestFps - cpuClock.refFps) > cpuClock.refFps * 0.15) {
+            // A different frame rate means a different scene (a movie ended): start over.
+            setCpuClock(100);
+            cpuClock.ceilingUntil = 0;
+            cpuClock.failedUntil = 0;
+            cpuClock.failures = 0;
+            return;
+        }
+        // A raise that cost speed is undone, and not retried above it for a while.
+        if (cpuClock.lastRaiseAt && now - cpuClock.lastRaiseAt < 3000 && speed < 97) {
+            cpuClock.ceiling = cpuClock.lastRaiseFrom;
+            cpuClock.ceilingUntil = now + 20000;
+            cpuClock.lastRaiseAt = 0;
+            setCpuClock(cpuClock.lastRaiseFrom);
+            return;
+        }
+        if (speed < 92) {
+            cpuClock.fastSamples = 0;
+            if (++cpuClock.slowSamples < 2) return;
+            cpuClock.slowSamples = 0;
+            // When the interpreter is the limit, speed scales with 1/clock: aim straight
+            // for the clock that would reach full speed, but stay above the highest clock
+            // at which the game lost frames (a binary search between it and the current).
+            const failed = now < (cpuClock.failedUntil || 0) ? cpuClock.failed : CPU_CLOCK_MIN - 5;
+            const estimate = Math.round(cpuClock.percent * Math.min(0.8, speed / 100 * 1.05) / 5) * 5;
+            const midpoint = Math.round((failed + cpuClock.percent) / 10) * 5;
+            const next = Math.min(cpuClock.percent - 5, Math.max(failed + 5, estimate,
+                failed >= CPU_CLOCK_MIN ? midpoint : 0));
+            if (next >= cpuClock.percent || next < CPU_CLOCK_MIN) return;
+            cpuClock.pending = {from: cpuClock.percent, refFps: cpuClock.refFps || guestFps,
+                judgeAt: now + 1500};
+            setCpuClock(next);
+            return;
+        }
+        cpuClock.slowSamples = 0;
+        if (speed >= 99 && cpuClock.percent < 100) {
+            if (++cpuClock.fastSamples < 4) return;
+            cpuClock.fastSamples = 0;
+            const ceiling = now < cpuClock.ceilingUntil ? cpuClock.ceiling : 100;
+            const next = Math.min(ceiling, cpuClock.percent + 5);
+            if (next <= cpuClock.percent) return;
+            cpuClock.lastRaiseAt = now;
+            cpuClock.lastRaiseFrom = cpuClock.percent;
+            setCpuClock(next);
+        }
+    }
+
+    // Updates `frameBudget.speed`, guest time per wall time relative to the
+    // selected fast-forward, once per window. Returns whether it did.
+    function sampleGuestSpeed(now) {
+        const fb = frameBudget;
+        if (fb.speedAt && now - fb.speedAt < FRAME_BUDGET_SPEED_WINDOW_MS) return false;
+        if (!fb.speedBuffer) fb.speedBuffer = wasmModule._malloc(11 * 8);
+        if (wasmModule._azahar_get_perf_stats(fb.speedBuffer, 11) !== 0) return false;
+        const stats = new Float64Array(wasmModule.HEAPU8.buffer, fb.speedBuffer, 11);
+        const guestUs = stats[10];
+        const multiplier = stats[9] || 1;
+        const wallMs = now - fb.speedAt;
+        const guestDeltaUs = guestUs - fb.speedGuestUs;
+        const valid = fb.speedAt && guestDeltaUs >= 0 && wallMs < FRAME_BUDGET_SPEED_WINDOW_MS * 1.5;
+        fb.speedAt = now;
+        fb.speedGuestUs = guestUs;
+        // Paused or held windows (Local Play waits, hidden tabs) say nothing.
+        if (!valid) return false;
+        fb.speed = guestDeltaUs / (wallMs * 1000 * multiplier);
+        fb.slowWindows = fb.speed < FRAME_BUDGET_SLOW ? fb.slowWindows + 1 : 0;
+        return true;
+    }
+
+    // Called after every emulated callback. `stepMs` is the core's share and
+    // `totalMs` the whole callback, including presentation and page work.
+    function tuneFrameBudget(now, stepMs, totalMs) {
+        if (!frameBudget.enabled || !wasmModule._azahar_set_work_budget_ms) return;
+        const fb = frameBudget;
+        // Callbacks start on refreshes, so the shortest recent gap is the refresh period.
+        if (fb.lastAt) {
+            const gap = now - fb.lastAt;
+            // The previous callback was a probe, so this gap is a single refresh.
+            if (fb.probeStage === 2) fb.probeGapMs = gap;
+            fb.intervals.push(gap);
+            if (fb.intervals.length > 120) fb.intervals.shift();
+            fb.periodMs = Math.max(2, Math.min(fb.probeGapMs, ...fb.intervals));
+        }
+        fb.lastAt = now;
+        fb.callbacks++;
+        const wasProbe = fb.probeStage === 1;
+        fb.probeStage = wasProbe ? 2 : 0;
+        if (fb.callbacks === 1 || fb.callbacks === 15 || fb.callbacks % FRAME_BUDGET_PROBE_EVERY === 0) {
+            fb.probeStage = 1;
+            fb.appliedMs = wasmModule._azahar_set_work_budget_ms(FRAME_BUDGET_PROBE_MS);
+            return;
+        }
+        // A probe's timings say nothing about the scene; restore the budget after it.
+        if (wasProbe) {
+            fb.appliedMs = wasmModule._azahar_set_work_budget_ms(fb.budgetMs);
+            return;
+        }
+        if (fb.intervals.length < 30) return;
+        const period = fb.periodMs;
+        const highRefresh = period < 12;
+        const spanRefreshes = Math.max(1, Math.round((1000 / 60) / period));
+        const saturated = stepMs >= fb.budgetMs - 0.5;
+        fb.overheadMs += (Math.max(0, totalMs - stepMs) - fb.overheadMs) * 0.05;
+        let spanned = fb.span === '60hz' || (fb.span === 'auto' && fb.spanned);
+        if (highRefresh && fb.span === 'auto' && sampleGuestSpeed(now)) {
+            const sinceChange = now - fb.spanChangedAt;
+            if (!spanned && fb.slowWindows >= 2) {
+                // A retry that failed quickly waits twice as long before the next one.
+                fb.retryMs = sinceChange < fb.retryMs + 5000 ? Math.min(60000, fb.retryMs * 2)
+                    : FRAME_BUDGET_RETRY_MS;
+                spanned = true;
+            } else if (spanned && sinceChange >= fb.retryMs && fb.speed >= 0.98) {
+                spanned = false;
+            }
+        }
+        const refreshes = highRefresh && spanned ? spanRefreshes : 1;
+        if (refreshes !== fb.refreshes) {
+            if (fb.refreshes) fb.spanChangedAt = now;
+            fb.refreshes = refreshes;
+            fb.spanned = refreshes > 1;
+            fb.slowWindows = 0;
+            // Start the new span from what fits rather than the old span's budget.
+            fb.budgetMs = Math.max(2, refreshes * period - FRAME_BUDGET_MARGIN_MS - fb.overheadMs);
+        }
+        // Finish a little before the last refresh of the span.
+        const targetMs = refreshes * period - FRAME_BUDGET_MARGIN_MS;
+        let budget = fb.budgetMs;
+        if (totalMs > targetMs) {
+            budget -= Math.min(4, (totalMs - targetMs) * 0.5);
+        } else if (saturated) {
+            // Grow only while the core used its whole budget; finishing early means
+            // game speed, not the budget, limited it.
+            budget += Math.min(0.5, (targetMs - totalMs) * 0.25);
+        }
+        // At 60 Hz never go below the fixed budget: where presenting is expensive
+        // (the software renderer) callbacks overrun a refresh anyway, and a smaller
+        // budget only did less work per frame (Mario Kart 7 fell from 51% to 44%).
+        // Elsewhere never give the core less than half of the span.
+        const floor = highRefresh ? refreshes * period * 0.5 : 14;
+        budget = Math.min(30, Math.max(floor, budget));
+        fb.budgetMs = budget;
+        if (Math.abs(budget - fb.appliedMs) >= 0.25) {
+            fb.appliedMs = wasmModule._azahar_set_work_budget_ms(budget);
+        }
+    }
+
+    function startRunning() {
+        if (!romLoaded || running) return;
+
+        running = true;
+        runStartedAt = performance.now();
+        nextBootStatusAt = runStartedAt;
+        rendererGraphicsDetected = false;
+        gameGraphicsDetected = false;
+        lastFpsAt = 0;
+        lastFrameCount = 0;
+        displayFps = 0;
+        emulationSpeed = 0;
+        btnRun.disabled = true;
+        btnStop.disabled = false;
+        btnStep.disabled = true;
+        log('Starting run loop at display refresh rate...');
+        showProgress(null);
+
+        function tick(now) {
+            if (!running) return;
+            // Local Play keeps linked consoles' game clocks together; a console that
+            // has run ahead waits here for the others.
+            if (window.AzaharNetplay?.shouldHold?.()) {
+                runAnimationFrame = AzaharScheduler.request(tick);
+                return;
+            }
+
+            const callbackStartedAt = performance.now();
+            try {
+                frameCount++;
+                const stepStartedAt = performance.now();
+                const result = wasmModule._azahar_step_frame();
+                const stepMs = performance.now() - stepStartedAt;
+                stepWorkMs += stepMs;
+                stepWorkFrames++;
+
+                if (result === 0) {
+                    updateCanvasFromWasm();
+                    updateBootStatus(now);
+                    // Update FPS meter every ~500 ms
+                    if (now - lastFpsAt >= 500) {
+                        if (lastFpsAt > 0) {
+                            displayFps = (frameCount - lastFrameCount) /
+                                ((now - lastFpsAt) / 1000);
+                        }
+                        lastFpsAt = now;
+                        lastFrameCount = frameCount;
+                        // Pull emulation speed from the C++ perf counters
+                        let gameFps = 0;
+                        if (wasmModule._azahar_get_perf_stats) {
+                            var buf = wasmModule._malloc(64); // 8 × f64
+                            if (wasmModule._azahar_get_perf_stats(buf, 8) === 0) {
+                                const stats = new Float64Array(wasmModule.HEAPU8.buffer, buf, 8);
+                                gameFps = stats[0];
+                                emulationSpeed = stats[2] * 100;
+                            }
+                            wasmModule._free(buf);
+                        }
+                        if (displayFps > 0) {
+                            const fpsText = gameFps.toFixed(0) + ' game FPS' +
+                                ' | ' + displayFps.toFixed(0) + ' display FPS' +
+                                (emulationSpeed > 0 ? ' | ' + emulationSpeed.toFixed(0) + '% speed' : '');
+                            if (fpsEl.textContent !== fpsText) fpsEl.textContent = fpsText;
+                        }
+                        checkDisplayThroughput(now);
+                        tuneCpuClock(now, gameFps, emulationSpeed);
+                        stepWorkMs = 0;
+                        stepWorkFrames = 0;
+                    }
+                    tuneFrameBudget(now, stepMs, performance.now() - callbackStartedAt);
+                    runAnimationFrame = AzaharScheduler.request(tick);
+                } else if (result === 1) {
+                    log('Emulation ended.');
+                    stopRunning('Emulation ended.', '');
+                } else {
+                    handleRunFailure(`frame error (code ${result})`, null);
+                }
+            } catch (err) {
+                // Preserve the WebAssembly function/offset stack in the log.
+                // A bare `unreachable` message hides the native renderer path
+                // that trapped, making scene-transition failures impossible
+                // to diagnose from an uploaded static deployment.
+                handleRunFailure(err.message, err);
+            }
+        }
+
+        runAnimationFrame = AzaharScheduler.request(tick);
+    }
+
+    btnRun.addEventListener('click', startRunning);
+
+    // ── Audio widget ─────────────────────────────────────────────
+    function setupAudioControls() {
+        const audio = window.AzaharAudio;
+        if (!audio || !btnSound) return;
+        const volumeInput = document.getElementById('audio-volume');
+        const volumeValue = document.getElementById('audio-volume-value');
+        const latencySelect = document.getElementById('audio-latency');
+        const stretchingInput = document.getElementById('audio-stretching');
+        const statusText = document.getElementById('audio-status');
+        const hasIcon = /^[🔊🔇]/u.test(btnSound.textContent);
+
+        function describe(state) {
+            if (!state.attached) return 'Audio starts when a game loads.';
+            if (state.muted) return 'Muted.';
+            if (!state.running) {
+                return 'Click or press a key on the page to start audio; browsers block sound until then.';
+            }
+            const rate = state.resampling ? ` · resampled to ${state.contextRate} Hz` : '';
+            return `Playing · ${Math.round(state.bufferedMs)} ms buffered · `
+                + `${state.underruns} dropout${state.underruns === 1 ? '' : 's'}${rate}`;
+        }
+
+        audio.onChange(function (state) {
+            const label = state.muted ? 'Sound: Off' : 'Sound: On';
+            btnSound.textContent = hasIcon ? `${state.muted ? '🔇' : '🔊'} ${label}` : label;
+            btnSound.setAttribute('aria-pressed', String(state.muted));
+            const percent = Math.round(state.volume * 100);
+            if (volumeInput && document.activeElement !== volumeInput) volumeInput.value = String(percent);
+            if (volumeValue) volumeValue.textContent = `${percent}%`;
+            if (latencySelect) latencySelect.value = String(state.latencyMs);
+            if (stretchingInput) stretchingInput.checked = state.stretching;
+            if (statusText) statusText.textContent = describe(state);
+        });
+
+        btnSound.addEventListener('click', () => audio.setMuted(!audio.isMuted()));
+        volumeInput?.addEventListener('input', () => {
+            audio.setVolume(Number(volumeInput.value) / 100);
+            // Raising the volume is an obvious request to hear the game.
+            if (audio.isMuted() && Number(volumeInput.value) > 0) audio.setMuted(false);
+        });
+        latencySelect?.addEventListener('change', () => audio.setLatencyMs(Number(latencySelect.value)));
+        stretchingInput?.addEventListener('change', () => audio.setStretching(stretchingInput.checked));
+        // Buffer level and dropouts change continuously while playing.
+        window.setInterval(() => {
+            const text = describe(audio.getState());
+            if (statusText && statusText.textContent !== text) statusText.textContent = text;
+        }, 500);
+    }
+
+    setupAudioControls();
+
+    btnStop.addEventListener('click', function () {
+        stopRunning();
+    });
+
+    function stopRunning(message, cls = 'error') {
+        running = false;
+        if (runAnimationFrame !== null) {
+            AzaharScheduler.cancel(runAnimationFrame);
+            runAnimationFrame = null;
+        }
+        hideProgress();
+        fpsEl.textContent = '';
+        btnRun.disabled = !romLoaded;
+        btnStop.disabled = true;
+        btnStep.disabled = !romLoaded;
+        // Callers that stop because something failed pass the reason; a bare
+        // "Stopped at step N" used to replace it and hide why the game stopped.
+        if (message) setStatus(message, cls);
+        else if (romLoaded) setStatus(`Stopped at step ${frameCount}`, '');
+    }
+
+    function isRomReadError(err) {
+        return err?.name === 'RomReadError' || /ROM read failed/.test(err?.message || '');
+    }
+
+    // The run loop failed: keep the reason visible, and recover where we can.
+    function handleRunFailure(detail, err) {
+        const step = frameCount;
+        log(`Run error at step ${step}: ${err ? (err.stack || err.message) : detail}`);
+        if (isRomReadError(err)) {
+            // Switching renderers cannot help: the file itself stopped being
+            // readable. Copy picked files into browser storage from now on.
+            rememberRomStaging();
+            stopRunning(`Stopped at step ${step}: the ROM file could not be read. ` +
+                'Files in Google Drive, on USB drives, or in Android/Linux folders can stop ' +
+                'being readable; choose the file again (or copy it to Downloads first). ' +
+                'The next load copies it into browser storage before starting.');
+            return;
+        }
+        // A WebGL2 failure before the first visible frame means this GPU path
+        // cannot run the title on this machine/driver. The compatibility
+        // renderer gets a fresh page and the same ROM.
+        if (isWebGL2Artifact && !gameGraphicsDetected && !softwareFallbackStarted) {
+            restartInSoftware(`accelerated renderer failed at step ${step}: ${detail}`);
+            return;
+        }
+        stopRunning(`Stopped at step ${step}: ${detail}`);
+    }
+
+    // ── Canvas Update ────────────────────────────────────────────
+    function updateCanvasFromWasm() {
+        if (isWebGL2Artifact || !canvas2dContext) {
+            // RendererWebGL2 draws directly to Module.canvas. A 2D blit would
+            // either fail or attempt to claim the already-WebGL canvas.
+            return;
+        }
+        // SDL2 on Emscripten renders to its own canvas (Module.canvas).
+        // Our canvas (#canvas) is separate, so we copy the pixels.
+        // If Module.canvas is different, blit from it.
+        var srcCanvas = null;
+        if (wasmModule && wasmModule.canvas) {
+            srcCanvas = wasmModule.canvas;
+        } else {
+            // Fallback: find the canvas SDL2 creates
+            var canvases = document.querySelectorAll('canvas');
+            if (canvases.length > 1) {
+                srcCanvas = canvases[1]; // SDL often creates a second canvas
+            }
+        }
+
+        if (srcCanvas && srcCanvas !== canvas) {
+            canvas2dContext.drawImage(srcCanvas, 0, 0, canvas.width, canvas.height);
+        }
+    }
+
+    // `bytes` is a Uint8Array, or a Blob/File that is mounted lazily.
+    async function loadRomBytes(bytes, name, shouldAutoStart = true, sourceUrl = '') {
+        if (coreUsed) {
+            throw new Error('A title was already loaded in this session; start a fresh session first.');
+        }
+        if (!initialized) {
+            setStatus('Initializing emulator for ROM...', 'ok');
+            await initializeEmulator();
+        }
+        if (!initialized) {
+            throw new Error('The emulator could not be initialized.');
+        }
+        if (running) {
+            stopRunning();
+        }
+        romName = name;
+        romPath = memfsRomPath(name);
+        if (fileLabel) {
+            fileLabel.textContent = `📄 ${romName} (${(romSize(bytes) / 1024 / 1024).toFixed(1)} MB)`;
+        }
+        romData = bytes;
+        romRecoveryUrl = sourceUrl;
+        romRecoveryFile = !sourceUrl && bytes instanceof Blob ? bytes : null;
+        romMounted = false;
+        log(`Loading ROM: ${romName} (${romSize(bytes)} bytes)`);
+        await loadAndRunRom();
+        if (shouldAutoStart && romLoaded && !running) {
+            startRunning();
+        }
+        return romLoaded;
+    }
+
+    // Start a new page session that plays `sourceUrl` from the library's
+    // local cache once the emulator is ready.
+    function restartWithPlayable(sourceUrl) {
+        if (running) stopRunning();
+        setStatus('Starting a fresh emulator session for the next game...', 'ok');
+        showProgress(null);
+        const destination = new URL(location.href);
+        destination.searchParams.set('play', sourceUrl);
+        location.assign(destination.toString());
+    }
+
+    // ── Public API for Shared Library & External Integration ─────
+    window.AzaharUI = {
+        loadRomBytes,
+        initializeEmulator,
+        isInitialized: () => initialized,
+        isRunning: () => running,
+        needsFreshSession: () => coreUsed,
+        restartWithPlayable,
+        stopRunning,
+        startRunning,
+        setStatus,
+        showProgress,
+        hideProgress,
+        log,
+        getLog: () => {
+            flushLogRepeats();
+            return logHistory.join('');
+        },
+        getCanvas: () => canvas,
+        getModule: () => (initialized ? wasmModule : null),
+        getCpuClock: () => ({ enabled: cpuClock.enabled, percent: cpuClock.percent,
+            changes: cpuClock.changes, refFps: cpuClock.refFps }),
+        getFrameBudget: () => ({ enabled: frameBudget.enabled, periodMs: frameBudget.periodMs,
+            budgetMs: frameBudget.appliedMs, refreshes: frameBudget.refreshes,
+            span: frameBudget.span, speed: frameBudget.speed }),
+    };
+
+    // ── Auto-init on page load ───────────────────────────────────
+    log('Azahar Web UI ready.');
+    setStatus('Loading WASM module...');
+    showProgress(null);
+    void initializeSaveStateStorage();
+    loadWasmModule().then(function () {
+        return initializeEmulator();
+    }).catch(function (err) {
+        hideProgress();
+        log(`WASM load failed: ${err.message}`);
+        setStatus(`Failed to load WASM: ${err.message}. Ensure ${artifactName}.js and ${artifactName}.wasm are in the same directory.`, 'error');
+        // Allow manual retry via Init button
+        btnInit.disabled = false;
+    });
+})();

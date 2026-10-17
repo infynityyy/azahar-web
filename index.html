@@ -1,0 +1,1523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" type="image/svg+xml" href="./app-icon.svg">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Azahar Web — Nintendo 3DS Emulator</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 16px;
+            position: relative;
+            isolation: isolate;
+        }
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: -1;
+            pointer-events: none;
+            opacity: .18;
+            background-image: repeating-linear-gradient(45deg, rgba(137,180,250,.12) 0 1px, transparent 1px 4px),
+                              repeating-linear-gradient(-45deg, rgba(0,0,0,.18) 0 1px, transparent 1px 4px);
+            background-size: 4px 4px;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 16px;
+        }
+        header h1 { font-size: 1.5rem; color: #ff6b6b; }
+        header p { font-size: 0.85rem; color: #888; }
+
+        .main-layout {
+            display: flex;
+            flex-wrap: wrap;
+            gap: var(--widget-gap, 16px);
+            max-width: 2400px;
+            width: 100%;
+            justify-content: center;
+            align-items: flex-start;
+        }
+        .canvas-panel {
+            flex: 0 0 804px;
+            min-width: 400px;
+            /* 800px drawable area plus the 2px border on each side gives the
+               native 400px buffer an exact 2x scale on desktop. */
+            max-width: 804px;
+            width: 100%;
+            text-align: center;
+            position: relative;
+        }
+        canvas {
+            border: 2px solid #333;
+            border-radius: 4px;
+            background: #000;
+            width: 100%;
+            /* Preserve the native 3DS pixels when the 400x480 dual-screen
+               image is enlarged. This matches the known-good gameplay capture
+               and avoids browser filtering that blurs HUD and control text. */
+            image-rendering: pixelated;
+        }
+        /* Widget grid: as many columns of at least --widget-w as fit. Widgets
+           span 1+ columns and keep their own height, so a tall widget never
+           stretches its row neighbours; dense packing back-fills the gaps. */
+        .controls-panel {
+            --widget-w: 260px;
+            --widget-gap: 12px;
+            flex: 1 1 calc(var(--widget-w) * 2 + var(--widget-gap));
+            min-width: 0;
+            width: 100%;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--widget-w)), 1fr));
+            grid-auto-flow: row dense;
+            /* Masonry: rows are 4px units and each widget spans as many as its
+               height needs (set by azahar_layout.js), so short widgets pack
+               under each other instead of leaving holes. */
+            grid-auto-rows: 4px;
+            column-gap: var(--widget-gap);
+            row-gap: 0;
+            align-items: start;
+            align-content: start;
+        }
+        .main-layout.widgets-below .controls-panel { flex-basis: 100%; }
+        @media (max-width: 840px) {
+            .canvas-panel {
+                flex: 1 1 auto;
+                max-width: 100%;
+            }
+        }
+        .card {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 16px;
+            min-width: 0;
+            overflow-wrap: break-word;
+            box-shadow: inset 1px 1px 0 rgba(183,207,255,.12),
+                        inset -1px -1px 0 rgba(0,0,0,.45), 0 5px 14px rgba(0,0,0,.2);
+        }
+        /* Reusable raised surface treatment for the app's mixed widgets. */
+        .active-download-card, .library-section, .library-table-container,
+        .save-entry, .log-box, .renderer-select, .library-select, .library-input,
+        .filter-pill, .btn, .file-label, canvas {
+            box-shadow: inset 1px 1px 0 rgba(183,207,255,.12),
+                        inset -1px -1px 0 rgba(0,0,0,.38);
+        }
+        .card h2 {
+            font-size: 1rem;
+            margin-bottom: 10px;
+            color: #e94560;
+            border-bottom: 1px solid #0f3460;
+            padding-bottom: 6px;
+        }
+
+        /* ── Widgets ─────────────────────────────────────────────── */
+        .controls-panel > .card { position: relative; display: flex; flex-direction: column; }
+        .controls-panel > .card.has-fixed-height { overflow: auto; }
+        .controls-panel > .card.is-collapsed { height: auto !important; overflow: hidden; }
+        .controls-panel > .card.is-collapsed > :not(h2) { display: none !important; }
+        .controls-panel > .card.is-collapsed > h2 { margin-bottom: 0; border-bottom: 0; padding-bottom: 0; }
+        .controls-panel > .card > h2 {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: grab;
+            user-select: none;
+            flex: none;
+        }
+        .widget-title { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .widget-tools { display: flex; gap: 3px; flex: none; opacity: .35; transition: opacity .2s; }
+        .card:hover .widget-tools, .widget-tools:focus-within { opacity: 1; }
+        @media (pointer: coarse) { .widget-tools { opacity: .8; } }
+        .widget-tool {
+            width: 22px;
+            height: 22px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #0d1730;
+            color: #c9d4ea;
+            font-size: .72rem;
+            line-height: 1;
+            cursor: pointer;
+        }
+        .widget-tool:hover, .widget-tool:focus-visible { border-color: #e94560; color: #fff; }
+        .widget-resize {
+            position: absolute;
+            right: 2px;
+            bottom: 2px;
+            width: 14px;
+            height: 14px;
+            cursor: nwse-resize;
+            touch-action: none;
+            opacity: .45;
+            background: linear-gradient(135deg, transparent 0 45%, #89b4fa 45% 52%, transparent 52% 65%,
+                                        #89b4fa 65% 72%, transparent 72%);
+        }
+        .widget-resize:hover { opacity: 1; }
+        .card.is-collapsed .widget-resize { display: none; }
+        .card.is-dragging { opacity: .45; outline: 2px dashed #e94560; }
+        .card.is-drop-target { outline: 2px solid #89b4fa; outline-offset: 2px; }
+        .card.is-resizing { outline: 2px dashed #89b4fa; outline-offset: 2px; }
+
+        /* Hamburger + layout drawer */
+        header { position: relative; width: 100%; max-width: 2400px; padding: 0 46px; }
+        .menu-toggle {
+            position: absolute;
+            left: 0;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 38px;
+            height: 34px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 5px;
+            padding: 0 9px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #16213e;
+            cursor: pointer;
+        }
+        .menu-toggle span { display: block; height: 2px; background: #e0e0e0; border-radius: 1px; }
+        .menu-toggle:hover, .menu-toggle[aria-expanded="true"] { border-color: #e94560; }
+        .layout-menu {
+            position: fixed;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            z-index: 900;
+            width: min(340px, 100vw);
+            overflow-y: auto;
+            padding: 16px;
+            background: #16213e;
+            border-right: 1px solid #0f3460;
+            box-shadow: 6px 0 24px rgba(0,0,0,.5);
+        }
+        .layout-menu[hidden], .layout-menu-backdrop[hidden] { display: none; }
+        .layout-menu-backdrop { position: fixed; inset: 0; z-index: 899; background: rgba(0,0,0,.45); }
+        .layout-menu-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+        .layout-menu-header h2 { font-size: 1rem; color: #e94560; }
+        .btn.layout-menu-close { width: auto; margin: 0; padding: 4px 10px; }
+        .layout-menu-subhead { font-size: .85rem; color: #89b4fa; margin: 14px 0 6px; }
+        .layout-widget-list { list-style: none; display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+        .layout-widget-list li {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 6px;
+            background: #0d1730;
+            border: 1px solid #253d69;
+            border-radius: 5px;
+            font-size: .8rem;
+        }
+        .layout-widget-list li.is-hidden .layout-widget-name { color: #66738c; text-decoration: line-through; }
+        .layout-widget-list input[type="checkbox"] { accent-color: #e94560; }
+        .layout-widget-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .layout-widget-actions { display: flex; gap: 3px; }
+        .layout-widget-actions select {
+            background: #0a0a1a; color: #e0e0e0; border: 1px solid #0f3460; border-radius: 4px; font-size: .72rem;
+        }
+        .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 600;
+            text-align: center;
+            width: 100%;
+            margin-bottom: 6px;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-primary { background: #e94560; color: #fff; }
+        .btn-secondary { background: #0f3460; color: #e0e0e0; }
+        .btn-success { background: #2d6a4f; color: #fff; }
+
+        input[type="file"] {
+            display: none;
+        }
+        .file-label {
+            display: block;
+            padding: 8px 16px;
+            border: 2px dashed #0f3460;
+            border-radius: 4px;
+            cursor: pointer;
+            text-align: center;
+            font-size: 0.9rem;
+            margin-bottom: 6px;
+            word-break: break-all;
+        }
+        .file-label:hover { border-color: #e94560; }
+
+        .renderer-select {
+            width: 100%;
+            margin-bottom: 6px;
+            padding: 8px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #0a0a1a;
+            color: #e0e0e0;
+        }
+        .mode-help { font-size: 0.72rem; color: #888; line-height: 1.35; }
+
+        .save-toolbar {
+            display: grid;
+            grid-template-columns: 82px 1fr;
+            gap: 6px;
+            align-items: start;
+        }
+        .save-toolbar .renderer-select { margin-bottom: 0; }
+        .save-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 8px;
+            max-height: 230px;
+            overflow-y: auto;
+        }
+        .save-empty { color: #777; font-size: 0.75rem; padding: 6px 0; }
+        .save-game-group { display: flex; flex-direction: column; gap: 5px; }
+        .save-game-title { color: #f0a2af; font-size: 0.76rem; font-weight: 700; overflow-wrap: anywhere; }
+        .save-game-id { color: #66738c; font-size: 0.62rem; font-family: monospace; }
+        .save-entry {
+            background: #0d1730;
+            border: 1px solid #253d69;
+            border-radius: 5px;
+            padding: 7px;
+        }
+        .save-entry-title { font-size: 0.78rem; font-weight: 700; color: #eee; }
+        .save-entry-meta {
+            color: #8995aa;
+            font-size: 0.67rem;
+            line-height: 1.4;
+            margin: 3px 0 6px;
+            overflow-wrap: anywhere;
+        }
+        .save-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+        .save-actions .btn { padding: 5px 7px; margin: 0; font-size: 0.72rem; }
+        .btn-danger { background: #71313d; color: #fff; }
+        #save-state-status { margin-top: 7px; min-height: 1em; }
+        .speed-control { margin-top: 10px; }
+        .speed-control label {
+            display: flex;
+            justify-content: space-between;
+            color: #aaa;
+            font-size: 0.76rem;
+            margin-bottom: 4px;
+        }
+        .speed-control input { width: 100%; accent-color: #e94560; }
+        /* Fullscreen view: the stage fills the display and the engine draws
+           both screens into a canvas of exactly the stage's shape. */
+        .screen-stage { position: relative; }
+        .screen-stage canvas { display: block; }
+        .screen-stage.is-fullscreen {
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            background: #000;
+            overflow: hidden;
+            touch-action: none;
+        }
+        .screen-stage.is-pseudo-fullscreen {
+            position: fixed;
+            inset: 0;
+            z-index: 1000;
+            width: 100vw;
+            height: 100dvh;
+        }
+        html.has-pseudo-fullscreen, html.has-pseudo-fullscreen body { overflow: hidden; }
+        .screen-stage.is-fullscreen canvas {
+            width: 100%;
+            height: 100%;
+            border: 0;
+            border-radius: 0;
+            box-shadow: none;
+            /* Before the emulator starts the canvas is still 400x480. */
+            object-fit: contain;
+        }
+        /* Sits in the native frame's empty corner beside the bottom screen. */
+        .stage-fullscreen-btn {
+            position: absolute;
+            right: 1.5%;
+            bottom: 1.5%;
+            width: 7%;
+            min-width: 26px;
+            max-width: 40px;
+            aspect-ratio: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: rgba(15, 52, 96, .75);
+            color: #e0e0e0;
+            cursor: pointer;
+            opacity: .6;
+            transition: opacity .2s;
+        }
+        .stage-fullscreen-btn svg { width: 62%; height: 62%; }
+        .stage-fullscreen-btn:hover, .stage-fullscreen-btn:focus-visible { opacity: 1; }
+        .screen-stage.is-fullscreen .stage-fullscreen-btn { display: none; }
+        .fullscreen-overlay {
+            display: none;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 6px;
+            opacity: .3;
+            transition: opacity .2s;
+            z-index: 1;
+        }
+        .screen-stage.is-fullscreen .fullscreen-overlay { display: flex; }
+        .fullscreen-overlay:hover, .fullscreen-overlay:focus-within,
+        .fullscreen-overlay.is-open { opacity: 1; }
+        .fullscreen-overlay-buttons { display: flex; gap: 6px; }
+        .fullscreen-overlay-buttons .btn { width: auto; margin: 0; padding: 6px 10px; }
+        .fullscreen-overlay-panel {
+            width: 260px;
+            background: rgba(22, 33, 62, .94);
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: left;
+        }
+        .audio-toggle { display: flex; gap: 6px; align-items: flex-start; margin-top: 10px; cursor: pointer; }
+        .audio-toggle input { accent-color: #e94560; margin-top: 2px; }
+        .local-play-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+        .local-play-row .btn { margin-bottom: 0; }
+        #local-play-card textarea { resize: vertical; min-height: 54px; font: 0.7rem ui-monospace, monospace; word-break: break-all; }
+        #local-play-card input[type="text"] { margin-bottom: 6px; }
+        #local-play-status { margin: 8px 0 4px; }
+        #local-play-status[data-kind="error"] { color: #ff7a8a; }
+        #local-play-status[data-kind="ok"], #local-play-status[data-kind="linked"] { color: #8fd6a6; }
+        #local-play-peers { margin: 0 0 6px 18px; font-size: 0.78rem; }
+        #public-lobby-list { margin: 6px 0; padding: 0; list-style: none; font-size: 0.78rem; }
+        #public-lobby-list li { display: flex; gap: 6px; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+        #public-lobby-list .btn { width: auto; margin: 0; padding: 4px 10px; }
+        #public-lobby-status[data-kind="error"] { color: #ff7a8a; }
+        #public-lobby-status[data-kind="ok"] { color: #8fd6a6; }
+        #local-play-card details { margin-top: 8px; }
+        #local-play-card summary { cursor: pointer; font-size: 0.8rem; margin-bottom: 6px; }
+        #audio-status { margin-top: 8px; }
+
+        #status {
+            font-size: 0.8rem;
+            color: #aaa;
+            min-height: 1.2em;
+            word-break: break-all;
+        }
+        #status.error { color: #ff6b6b; }
+        #status.ok { color: #6bff6b; }
+
+        #progress {
+            width: 100%;
+            height: 7px;
+            margin-top: 6px;
+            accent-color: #e94560;
+        }
+
+        .log-box {
+            background: #0a0a1a;
+            border: 1px solid #333;
+            border-radius: 4px;
+            padding: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.7rem;
+            color: #aaa;
+            max-height: 120px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        /* ── Game Library Section ────────────────────────────────── */
+        .library-section {
+            max-width: 2400px;
+            width: 100%;
+            margin-top: 20px;
+            margin-bottom: 30px;
+        }
+        .library-header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 8px;
+            margin-bottom: 12px;
+            border-bottom: 1px solid #0f3460;
+            padding-bottom: 8px;
+        }
+        .library-title-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .library-header h2 {
+            font-size: 1.15rem;
+            color: #ff6b6b;
+            margin: 0;
+            border: none;
+            padding: 0;
+        }
+        .library-badge {
+            background: #0f3460;
+            color: #89b4fa;
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 12px;
+            border: 1px solid #254b77;
+        }
+        .library-subtitle {
+            font-size: 0.75rem;
+            color: #888;
+            margin-top: 4px;
+            width: 100%;
+        }
+
+        /* Active download banner */
+        .active-download-card {
+            background: #0f2b48;
+            border: 1px solid #1a5688;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 14px;
+        }
+        .active-download-info {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.82rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+            color: #e0e0e0;
+        }
+        .active-download-stats {
+            color: #6bff6b;
+            font-family: monospace;
+        }
+        .progress-bar-container {
+            background: #091a2c;
+            border-radius: 4px;
+            height: 10px;
+            overflow: hidden;
+            margin-bottom: 6px;
+            border: 1px solid #1a426b;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #e94560, #ff8a7a);
+            width: 0%;
+            transition: width 0.15s ease-out;
+        }
+        .active-download-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.72rem;
+            color: #8ab4f8;
+        }
+
+        /* Downloaded games ready to play from the local cache */
+        .ready-card {
+            background: #0f2b1f;
+            border: 1px solid #1a6b44;
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 14px;
+        }
+        .ready-header { font-size: .82rem; font-weight: 600; color: #6bff6b; margin-bottom: 6px; }
+        .ready-list { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; }
+        .ready-game {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 0;
+            border-top: 1px solid rgba(107,255,107,.12);
+        }
+        .ready-game:first-child { border-top: none; }
+        .ready-game-info { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+
+        /* Toolbar */
+        .library-toolbar {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-bottom: 14px;
+        }
+        .library-source-controls {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 11px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #101a32;
+            box-shadow: inset 1px 1px 0 rgba(183,207,255,.12), inset -1px -1px 0 rgba(0,0,0,.38);
+        }
+        .library-source-label { color: #aab8cc; font-size: .76rem; font-weight: 600; }
+        .library-source-link {
+            min-width: 0;
+            color: #89b4fa;
+            font-size: .72rem;
+            overflow-wrap: anywhere;
+        }
+        .library-source-link:hover { color: #c2dcff; }
+        .search-wrap {
+            position: relative;
+            width: 100%;
+        }
+        .library-input {
+            width: 100%;
+            padding: 10px 36px 10px 14px;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #0a0a1a;
+            color: #e0e0e0;
+            font-size: 0.88rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .library-input:focus {
+            border-color: #e94560;
+            box-shadow: inset 1px 1px 0 rgba(183,207,255,.14), 0 0 0 2px rgba(233,69,96,.18);
+        }
+        .search-clear-btn {
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 1.1rem;
+            cursor: pointer;
+            padding: 4px;
+            line-height: 1;
+        }
+        .search-clear-btn:hover { color: #fff; }
+
+        .filter-row {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+        }
+        .region-filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+        .filter-pill {
+            background: #0f3460;
+            color: #ccc;
+            border: 1px solid #1a4b80;
+            border-radius: 14px;
+            padding: 4px 12px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .filter-pill:hover {
+            background: #1a4b80;
+            color: #fff;
+        }
+        .filter-pill.active {
+            background: #e94560;
+            border-color: #ff6b6b;
+            color: #fff;
+            font-weight: 600;
+            box-shadow: inset 1px 1px 0 rgba(255,255,255,.2), inset -1px -1px 0 rgba(60,0,10,.32);
+        }
+        .sort-controls {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .sort-label {
+            font-size: 0.75rem;
+            color: #888;
+        }
+        .library-select {
+            padding: 5px 8px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #0a0a1a;
+            color: #e0e0e0;
+            font-size: 0.75rem;
+        }
+
+        /* Table */
+        .library-table-container {
+            width: 100%;
+            overflow-x: auto;
+            border: 1px solid #0f3460;
+            border-radius: 6px;
+            background: #0d1730;
+            max-height: 520px;
+            overflow-y: auto;
+        }
+        .library-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+            text-align: left;
+        }
+        .library-table th {
+            position: sticky;
+            top: 0;
+            background: #0a1124;
+            color: #8899aa;
+            font-weight: 600;
+            padding: 9px 12px;
+            border-bottom: 1px solid #1a3359;
+            z-index: 1;
+        }
+        .library-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid #142340;
+            vertical-align: middle;
+        }
+        .library-table tr:hover {
+            background: #13203f;
+        }
+        .game-title-col {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        .game-name {
+            font-weight: 600;
+            color: #f0f0f0;
+            word-break: break-word;
+        }
+        .game-filename {
+            font-size: 0.68rem;
+            color: #72849e;
+            font-family: monospace;
+            word-break: break-all;
+        }
+        .region-badge {
+            display: inline-block;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 0.68rem;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        .badge-usa { background: #1a3359; color: #8ab4f8; border: 1px solid #2d4f80; }
+        .badge-europe { background: #123828; color: #81c995; border: 1px solid #1d523b; }
+        .badge-japan { background: #3d1c24; color: #f28b82; border: 1px solid #5a2935; }
+        .badge-other { background: #262933; color: #bdc1c6; border: 1px solid #3c4043; }
+
+        .size-badge {
+            font-family: monospace;
+            color: #a0aec0;
+            font-size: 0.72rem;
+            white-space: nowrap;
+        }
+        .game-actions-col {
+            display: flex;
+            gap: 5px;
+            justify-content: flex-end;
+            align-items: center;
+        }
+        .btn-sm {
+            padding: 4px 9px;
+            font-size: 0.72rem;
+            border-radius: 4px;
+            width: auto;
+            margin-bottom: 0;
+            text-decoration: none;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .icon-btn {
+            background: #0f3460;
+            color: #99b8db;
+            border: 1px solid #1b497b;
+        }
+        .icon-btn:hover {
+            background: #174274;
+            color: #fff;
+        }
+        .library-empty {
+            text-align: center;
+            color: #888;
+            padding: 30px;
+            font-size: 0.85rem;
+        }
+
+        /* Pagination */
+        .library-pagination {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            margin-top: 10px;
+            padding: 4px 0;
+        }
+        .page-info {
+            font-size: 0.75rem;
+            color: #aaa;
+        }
+        .page-size-select {
+            margin-left: auto;
+        }
+        .keymap-dialog {
+            margin: auto;
+            width: min(560px, calc(100vw - 32px));
+            max-height: calc(100vh - 32px);
+            overflow-y: auto;
+            background: #16213e;
+            color: #e0e0e0;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .keymap-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+        .keymap-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            border-bottom: 1px solid #0f3460;
+            padding-bottom: 6px;
+            margin-bottom: 8px;
+        }
+        .keymap-header h2 { font-size: 1rem; color: #e94560; }
+        .keymap-close { width: auto; margin: 0; }
+        .keymap-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; margin-bottom: 8px; }
+        .keymap-table th, .keymap-table td { padding: 4px 6px; text-align: left; }
+        .keymap-table thead th { color: #aaa; font-weight: 600; border-bottom: 1px solid #0f3460; }
+        .keymap-group th { color: #89b4fa; font-size: 0.75rem; padding-top: 10px; }
+        .keymap-pad { color: #aaa; }
+        .gamepad-status { margin: 2px 0 8px; }
+        .keymap-table kbd {
+            display: inline-block;
+            min-width: 1.6em;
+            padding: 1px 6px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #1a1a2e;
+            font-family: inherit;
+            text-align: center;
+        }
+
+        /* ── On-screen controls ──────────────────────────────────── */
+        /* Sized to fit comfortably beside the bottom screen on phones, wrapping
+           over the left and right sides without obscuring the gameplay area. */
+        .touch-controls {
+            --tc-u: clamp(22px, 6.5vw, 36px);
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            margin-top: 8px;
+            color: #e0e0e0;
+            font-weight: 700;
+            line-height: 1;
+            -webkit-user-select: none;
+            user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .touch-controls[hidden] { display: none !important; }
+        .touch-half {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: calc(var(--tc-u) * .22);
+            padding: calc(var(--tc-u) * .15);
+            touch-action: none;
+        }
+        .touch-shoulders, .touch-system { display: flex; gap: calc(var(--tc-u) * .25); }
+        .touch-btn, .touch-dpad-arm, .touch-dpad-center {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(15, 52, 96, .65);
+            backdrop-filter: blur(4px);
+            -webkit-backdrop-filter: blur(4px);
+            border: 1px solid rgba(137, 180, 250, .35);
+            box-shadow: inset 1px 1px 0 rgba(183,207,255,.15), inset -1px -1px 0 rgba(0,0,0,.4);
+        }
+        .touch-btn.is-pressed, .touch-dpad-arm.is-pressed {
+            background: #e94560;
+            border-color: #ff8a9a;
+            color: #fff;
+        }
+        .touch-shoulder {
+            width: calc(var(--tc-u) * 1.4);
+            height: calc(var(--tc-u) * .75);
+            border-radius: calc(var(--tc-u) * .38);
+            font-size: calc(var(--tc-u) * .34);
+        }
+        .touch-system-btn {
+            min-width: calc(var(--tc-u) * 1.3);
+            height: calc(var(--tc-u) * .55);
+            padding: 0 calc(var(--tc-u) * .18);
+            border-radius: calc(var(--tc-u) * .28);
+            font-size: calc(var(--tc-u) * .24);
+            letter-spacing: .04em;
+        }
+        .touch-face, .touch-dpad {
+            display: grid;
+            grid-template-columns: repeat(3, calc(var(--tc-u) * 1.05));
+            grid-template-rows: repeat(3, calc(var(--tc-u) * 1.05));
+        }
+        .touch-face-btn { border-radius: 50%; font-size: calc(var(--tc-u) * .45); }
+        .touch-face-x { grid-area: 1 / 2; }
+        .touch-face-y { grid-area: 2 / 1; }
+        .touch-face-a { grid-area: 2 / 3; }
+        .touch-face-b { grid-area: 3 / 2; }
+        .touch-dpad-arm { color: rgba(224, 224, 224, .6); font-size: calc(var(--tc-u) * .32); }
+        .touch-dpad-arm.is-pressed { color: #fff; }
+        .touch-dpad-up { grid-area: 1 / 2; border-radius: 6px 6px 0 0; border-bottom: 0; }
+        .touch-dpad-down { grid-area: 3 / 2; border-radius: 0 0 6px 6px; border-top: 0; }
+        .touch-dpad-left { grid-area: 2 / 1; border-radius: 6px 0 0 6px; border-right: 0; }
+        .touch-dpad-right { grid-area: 2 / 3; border-radius: 0 6px 6px 0; border-left: 0; }
+        .touch-dpad-center { grid-area: 2 / 2; border-width: 1px 0; border-color: transparent; box-shadow: none; }
+        .touch-dpad-up::after { content: '▲'; }
+        .touch-dpad-down::after { content: '▼'; }
+        .touch-dpad-left::after { content: '◀'; }
+        .touch-dpad-right::after { content: '▶'; }
+        .touch-stick {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: calc(var(--tc-u) * 2.2);
+            height: calc(var(--tc-u) * 2.2);
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(15,52,96,.3), rgba(15,52,96,.75));
+            border: 1px solid rgba(137, 180, 250, .35);
+            backdrop-filter: blur(4px);
+            -webkit-backdrop-filter: blur(4px);
+        }
+        .touch-stick-knob {
+            width: 48%;
+            height: 48%;
+            border-radius: 50%;
+            background: #2a4a7a;
+            border: 1px solid rgba(183, 207, 255, .5);
+            box-shadow: 0 2px 6px rgba(0,0,0,.45);
+            pointer-events: none;
+        }
+        .touch-stick.is-active .touch-stick-knob { background: #e94560; border-color: #ff8a9a; }
+        /* The New 3DS C-Stick is a small nub above and inside the face buttons. */
+        .touch-stick-cstick {
+            width: calc(var(--tc-u) * 1.5);
+            height: calc(var(--tc-u) * 1.5);
+            align-self: flex-start;
+        }
+
+        /* ── Mobile Layout & Touch Controls ───────────────────────── */
+        /* Normal page view: on mobile, conserve padding and give canvas full usable width */
+        @media (max-width: 768px) {
+            body {
+                padding: max(8px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left));
+            }
+            header {
+                padding: 0 38px;
+                margin-bottom: 8px;
+            }
+            header h1 { font-size: 1.25rem; }
+            header p { font-size: 0.75rem; }
+            .canvas-panel {
+                min-width: 0;
+                max-width: 100%;
+                width: 100%;
+            }
+        }
+
+        /* Mobile landscape: prevent canvas overflowing off-screen and arrange controls comfortably */
+        @media (orientation: landscape) and (max-height: 580px) {
+            body {
+                padding: max(4px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(4px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+            }
+            header {
+                margin-bottom: 4px;
+                padding: 0 38px;
+            }
+            header h1 { font-size: 1.1rem; }
+            header p { display: none; }
+            .canvas-panel {
+                flex: 0 1 auto;
+                max-width: 100%;
+                min-width: 0;
+            }
+            .canvas-panel canvas {
+                max-height: calc(100vh - 48px);
+                width: auto;
+                aspect-ratio: 400 / 480;
+                object-fit: contain;
+            }
+            .canvas-panel > .touch-controls {
+                position: static;
+                display: flex;
+                justify-content: center;
+                gap: 16px;
+                margin-top: 6px;
+                --tc-u: clamp(16px, 4.6vh, 22px);
+            }
+        }
+
+        /* Normal page view (portrait): touch controls overlay over the bottom half with zero overflow */
+        @media (max-width: 768px) and (orientation: portrait), (pointer: coarse) and (orientation: portrait) {
+            .canvas-panel {
+                position: relative;
+                min-width: 0;
+            }
+            .canvas-panel > .touch-controls {
+                position: absolute;
+                top: 48%;
+                bottom: 22px;
+                left: 0;
+                right: 0;
+                margin-top: 0;
+                pointer-events: none;
+                display: flex;
+                justify-content: space-between;
+                align-items: flex-end;
+                z-index: 5;
+                --tc-u: clamp(18px, 5.2vw, 25px);
+            }
+            .canvas-panel > .touch-controls .touch-half {
+                pointer-events: auto;
+                justify-content: flex-end;
+                padding: calc(var(--tc-u) * .1);
+                padding-bottom: 2px;
+            }
+        }
+
+        /* Fullscreen: in landscape, 3 columns (left controls, dual screens in canvas, right controls).
+           In portrait, screens sit cleanly at the top and controls sit below, unobstructed and ergonomic. */
+        .screen-stage.is-fullscreen.has-touch-controls {
+            display: grid;
+            grid-template: "left screens right" minmax(0, 1fr) / auto minmax(0, 1fr) auto;
+            overflow: hidden;
+            touch-action: none;
+        }
+        .screen-stage.is-fullscreen.has-touch-controls canvas {
+            grid-area: screens;
+            min-width: 0;
+            min-height: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        .screen-stage.is-fullscreen .touch-controls { display: contents; }
+        .screen-stage.is-fullscreen .touch-half {
+            justify-content: space-between;
+            padding-top: max(calc(var(--tc-u) * .2), env(safe-area-inset-top));
+            padding-bottom: max(calc(var(--tc-u) * .2), env(safe-area-inset-bottom));
+        }
+        .screen-stage.is-fullscreen .touch-left {
+            grid-area: left;
+            padding-left: max(calc(var(--tc-u) * .2), env(safe-area-inset-left));
+        }
+        .screen-stage.is-fullscreen .touch-right {
+            grid-area: right;
+            padding-right: max(calc(var(--tc-u) * .2), env(safe-area-inset-right));
+        }
+
+        @media (orientation: landscape) {
+            .touch-controls {
+                --tc-u: clamp(16px, 5.5vh, 26px);
+            }
+            .screen-stage.is-fullscreen.has-touch-controls .touch-half {
+                justify-content: space-evenly;
+                gap: calc(var(--tc-u) * .12);
+            }
+        }
+
+        @media (orientation: portrait) {
+            .touch-controls {
+                --tc-u: clamp(18px, 5.5vw, 28px);
+            }
+            .screen-stage.is-fullscreen.has-touch-controls {
+                display: grid;
+                grid-template: "screens screens" minmax(0, 1fr) "left right" auto / 1fr 1fr;
+                width: 100vw;
+                height: 100dvh;
+                position: relative;
+                overflow: hidden;
+            }
+            .screen-stage.is-fullscreen.has-touch-controls canvas {
+                grid-area: screens;
+                width: 100%;
+                height: 100%;
+                min-width: 0;
+                min-height: 0;
+                display: block;
+                object-fit: contain;
+            }
+            .screen-stage.is-fullscreen.has-touch-controls .touch-controls {
+                display: contents;
+            }
+            .screen-stage.is-fullscreen.has-touch-controls .touch-half {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: flex-end;
+                gap: calc(var(--tc-u) * .2);
+                padding: calc(var(--tc-u) * .15);
+                padding-bottom: max(calc(var(--tc-u) * .35), env(safe-area-inset-bottom));
+                pointer-events: auto;
+                z-index: 10;
+            }
+            .screen-stage.is-fullscreen.has-touch-controls .touch-left {
+                grid-area: left;
+                padding-left: max(calc(var(--tc-u) * .2), env(safe-area-inset-left));
+            }
+            .screen-stage.is-fullscreen.has-touch-controls .touch-right {
+                grid-area: right;
+                padding-right: max(calc(var(--tc-u) * .2), env(safe-area-inset-right));
+            }
+        }
+
+        /* Move the stage fullscreen button to top-right when touch controls are shown
+           so it does not collide with the right-hand touch buttons. */
+        .screen-stage.has-touch-controls .stage-fullscreen-btn {
+            top: 2%;
+            bottom: auto;
+            right: 2%;
+        }
+        /* Keep the fullscreen buttons off the right-hand controls. */
+        .screen-stage.has-touch-controls .fullscreen-overlay {
+            right: 50%;
+            transform: translateX(50%);
+            align-items: center;
+        }
+        /* Phones narrower than the native 400px frame. */
+        @media (max-width: 460px) {
+            .canvas-panel { min-width: 0; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <button type="button" class="menu-toggle" id="btn-layout-menu" aria-label="Layout menu"
+                aria-expanded="false" aria-controls="layout-menu" title="Layout menu">
+            <span></span><span></span><span></span>
+        </button>
+        <h1>🎮 Azahar Web</h1>
+        <p>Nintendo 3DS Emulator — WebAssembly Proof-of-Concept</p>
+    </header>
+
+    <aside class="layout-menu" id="layout-menu" hidden aria-label="Layout menu">
+        <div class="layout-menu-header">
+            <h2>☰ Layout</h2>
+            <button type="button" class="btn btn-secondary layout-menu-close" id="btn-layout-menu-close" aria-label="Close layout menu">✕</button>
+        </div>
+        <div class="speed-control">
+            <label for="layout-widget-width">
+                <span>Widget width</span><output id="layout-widget-width-value">260px</output>
+            </label>
+            <input id="layout-widget-width" type="range" min="200" max="480" step="10" value="260"
+                   aria-label="Minimum widget width">
+        </div>
+        <div class="speed-control">
+            <label for="layout-gap">
+                <span>Spacing</span><output id="layout-gap-value">12px</output>
+            </label>
+            <input id="layout-gap" type="range" min="4" max="28" step="2" value="12" aria-label="Spacing between widgets">
+        </div>
+        <label class="mode-help audio-toggle">
+            <input type="checkbox" id="layout-beside-screen" checked>
+            Place widgets beside the screen when there is room
+        </label>
+        <h3 class="layout-menu-subhead">Widgets</h3>
+        <ul class="layout-widget-list" id="layout-widget-list"></ul>
+        <div class="mode-help">Drag a widget by its title to move it, drag its corner to resize it, or use the buttons here. Double-click a corner to reset that widget's size.</div>
+        <button type="button" class="btn btn-primary" id="btn-layout-reset" style="margin-top:10px;">↺ Reset to default layout</button>
+    </aside>
+    <div class="layout-menu-backdrop" id="layout-menu-backdrop" hidden></div>
+
+    <div class="main-layout">
+        <div class="canvas-panel">
+            <div id="screen-stage" class="screen-stage">
+                <canvas id="canvas" width="400" height="480"></canvas>
+                <button type="button" class="stage-fullscreen-btn" id="btn-fullscreen-stage"
+                        title="Fullscreen (Alt+Enter)" aria-label="Fullscreen">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor"
+                         stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>
+                    </svg>
+                </button>
+                <div class="fullscreen-overlay" id="fullscreen-overlay">
+                    <div class="fullscreen-overlay-buttons">
+                        <button type="button" class="btn btn-secondary" id="btn-fullscreen-settings"
+                                aria-expanded="false" aria-controls="fullscreen-overlay-panel">⚙ Screen sizes</button>
+                        <button type="button" class="btn btn-secondary" id="btn-fullscreen-exit">✕ Exit</button>
+                    </div>
+                    <div class="fullscreen-overlay-panel" id="fullscreen-overlay-panel" hidden></div>
+                </div>
+            </div>
+            <p style="font-size:0.7rem;color:#555;margin-top:4px;">
+                Native 400×480 — Top: 400×240, Bottom: 320×240
+                <span id="fps" style="margin-left:12px;color:#aaa;"></span>
+            </p>
+        </div>
+
+        <div class="controls-panel" id="widget-grid">
+            <div class="card" data-widget="renderer">
+                <h2>Renderer</h2>
+                <select id="renderer-mode" class="renderer-select" aria-label="Renderer mode">
+                    <option value="auto">Auto — best for this machine</option>
+                    <option value="webgl2">Accelerated (WebGL2)</option>
+                    <option value="software">Compatibility (software)</option>
+                </select>
+                <div id="renderer-mode-help" class="mode-help"></div>
+                <button type="button" id="renderer-remeasure" class="btn btn-secondary" hidden
+                        style="margin-top:8px;padding:4px 8px;font-size:0.7rem;">
+                    Re-measure this machine
+                </button>
+                <label for="resolution-scale" class="mode-help" style="display:block;margin-top:12px;margin-bottom:4px;">
+                    Internal resolution
+                </label>
+                <select id="resolution-scale" class="renderer-select" aria-label="Internal resolution">
+                    <option value="1">1x Native (fastest)</option>
+                    <option value="2">2x (800x480 top)</option>
+                    <option value="3">3x (1200x720 top)</option>
+                    <option value="4">4x (1600x960 top)</option>
+                </select>
+                <div id="resolution-scale-help" class="mode-help"></div>
+                <label for="software-detail" class="mode-help" style="display:block;margin-top:12px;margin-bottom:4px;">
+                    Software detail
+                </label>
+                <select id="software-detail" class="renderer-select" aria-label="Software detail">
+                    <option value="1">Full — every pixel</option>
+                    <option value="3">Fast — 3x3 blocks (blurry)</option>
+                </select>
+            </div>
+            <div class="card" data-widget="rom">
+                <h2>📂 ROM File</h2>
+                <button type="button" class="btn btn-secondary" id="btn-browse-library" style="margin-bottom:8px;">
+                    📚 Browse Shared Library (1,945 Games)
+                </button>
+                <input type="file" id="rom-file" accept=".3ds,.3dsx,.cia,.elf,.cxi,.app,.cci">
+                <label for="rom-file" class="file-label" id="file-label">
+                    Or choose a local 3DS ROM file...
+                </label>
+                <button class="btn btn-primary" id="btn-load" disabled>Load &amp; Run</button>
+                <div id="status">Ready. Load a ROM to begin.</div>
+                <progress id="progress" max="100" value="0" hidden></progress>
+            </div>
+
+            <div class="card" data-widget="controls">
+                <h2>▶ Controls</h2>
+                <button class="btn btn-primary" id="btn-init" disabled>Initialize Emulator</button>
+                <button class="btn btn-success" id="btn-step" disabled>Step Frame</button>
+                <button class="btn btn-secondary" id="btn-run" disabled>▶ Run / Resume</button>
+                <button class="btn btn-secondary" id="btn-stop" disabled>⏹ Stop</button>
+                <button type="button" class="btn btn-secondary" id="btn-keymap">⌨ Keymap</button>
+                <label for="touch-controls-mode" class="mode-help" style="display:block;margin-top:6px;margin-bottom:4px;">
+                    On-screen controls
+                </label>
+                <select id="touch-controls-mode" class="renderer-select" aria-label="On-screen controls">
+                    <option value="auto">Auto — touch screens without a gamepad</option>
+                    <option value="on">Always show</option>
+                    <option value="off">Hide</option>
+                </select>
+                <div id="touch-controls-help" class="mode-help" aria-live="polite"></div>
+                <div class="speed-control">
+                    <label for="fast-forward">
+                        <span>Fast-forward</span><output id="fast-forward-value">1x</output>
+                    </label>
+                    <input id="fast-forward" type="range" min="1" max="4" step="1" value="1"
+                           aria-label="Fast-forward multiplier">
+                    <div class="mode-help">Target speed for cutscenes: 1x normal, up to 4x fast-forward. Actual speed depends on your device and the game.</div>
+                </div>
+            </div>
+
+            <div class="card" id="fullscreen-card" data-widget="fullscreen">
+                <h2>⛶ Fullscreen</h2>
+                <button type="button" class="btn btn-secondary" id="btn-fullscreen">⛶ Fullscreen</button>
+                <div id="fullscreen-settings">
+                    <label for="fullscreen-arrangement" class="mode-help" style="display:block;margin-top:6px;margin-bottom:4px;">
+                        Screen arrangement
+                    </label>
+                    <select id="fullscreen-arrangement" class="renderer-select" aria-label="Fullscreen screen arrangement">
+                        <option value="auto">Auto — biggest top screen</option>
+                        <option value="side">Side by side</option>
+                        <option value="stacked">Stacked</option>
+                    </select>
+                    <div class="speed-control">
+                        <label for="fullscreen-bottom-min">
+                            <span>Bottom screen minimum</span><output id="fullscreen-bottom-min-value">40%</output>
+                        </label>
+                        <input id="fullscreen-bottom-min" type="range" min="20" max="100" step="1" value="40"
+                               aria-label="Bottom screen minimum size, percent of the top screen">
+                    </div>
+                    <div class="speed-control">
+                        <label for="fullscreen-bottom-max">
+                            <span>Bottom screen maximum</span><output id="fullscreen-bottom-max-value">70%</output>
+                        </label>
+                        <input id="fullscreen-bottom-max" type="range" min="20" max="100" step="1" value="70"
+                               aria-label="Bottom screen maximum size, percent of the top screen">
+                    </div>
+                    <div id="fullscreen-help" class="mode-help" aria-live="polite"></div>
+                </div>
+                <div class="mode-help" style="margin-top:7px;">Alt+Enter toggles fullscreen.</div>
+            </div>
+
+            <div class="card" id="audio-card" data-widget="audio">
+                <h2>🔊 Audio</h2>
+                <button type="button" class="btn btn-secondary" id="btn-sound" aria-pressed="false">🔊 Sound: On</button>
+                <div class="speed-control">
+                    <label for="audio-volume">
+                        <span>Volume</span><output id="audio-volume-value">80%</output>
+                    </label>
+                    <input id="audio-volume" type="range" min="0" max="100" step="1" value="80"
+                           aria-label="Volume">
+                </div>
+                <label for="audio-latency" class="mode-help" style="display:block;margin-top:10px;margin-bottom:4px;">
+                    Audio buffer (pacing)
+                </label>
+                <select id="audio-latency" class="renderer-select" aria-label="Audio buffer">
+                    <option value="50">50 ms — lowest latency</option>
+                    <option value="100">100 ms — balanced</option>
+                    <option value="150">150 ms — fewer dropouts</option>
+                    <option value="200">200 ms — smoothest on slow machines</option>
+                </select>
+                <label class="mode-help audio-toggle">
+                    <input type="checkbox" id="audio-stretching" checked>
+                    Time stretching: when the game runs slow, slow the sound down with it instead of letting it crackle
+                </label>
+                <div id="audio-status" class="mode-help" aria-live="polite">Audio starts when a game loads.</div>
+            </div>
+
+            <div class="card" id="local-play-card" data-widget="local-play" data-default-span="2">
+                <h2>📡 Local Play</h2>
+                <input type="text" id="local-play-name" class="renderer-select" maxlength="10"
+                       placeholder="Your name" aria-label="Your name" autocomplete="nickname">
+                <div class="local-play-row">
+                    <button type="button" class="btn btn-primary" id="btn-local-play-invite">Host: create invite</button>
+                    <button type="button" class="btn btn-secondary" id="btn-local-play-leave" disabled>Leave</button>
+                </div>
+                <textarea id="local-play-code-out" class="renderer-select" readonly
+                          placeholder="Your invite or reply code appears here" aria-label="Code to send"></textarea>
+                <button type="button" class="btn btn-secondary" id="btn-local-play-copy">Copy code</button>
+                <textarea id="local-play-code-in" class="renderer-select"
+                          placeholder="Paste an invite (to join) or a reply (as host)" aria-label="Code received"></textarea>
+                <button type="button" class="btn btn-success" id="btn-local-play-accept">Use pasted code</button>
+                <div id="local-play-status" class="mode-help" aria-live="polite">Not linked.</div>
+                <ul id="local-play-peers"></ul>
+                <label class="mode-help audio-toggle">
+                    <input type="checkbox" id="local-play-cross-version" checked>
+                    Cross-version play: let a demo find a network hosted by the full game, and the other way round
+                </label>
+                <details id="public-lobbies" open>
+                    <summary>Public lobbies</summary>
+                    <input type="text" id="public-lobby-name" class="renderer-select" maxlength="40"
+                           placeholder="Lobby name (optional)" aria-label="Lobby name">
+                    <div class="local-play-row">
+                        <button type="button" class="btn btn-primary" id="btn-public-lobby-host">Host public lobby</button>
+                        <button type="button" class="btn btn-secondary" id="btn-public-lobby-find">Find lobbies</button>
+                    </div>
+                    <button type="button" class="btn btn-secondary" id="btn-public-lobby-stop" disabled>Stop listing / looking</button>
+                    <div id="public-lobby-status" class="mode-help" aria-live="polite">Not listed and not looking.</div>
+                    <ul id="public-lobby-list"></ul>
+                    <div class="mode-help">Lobbies are found through public WebTorrent trackers, which see the lobby name and connection details; game data still goes directly between players.</div>
+                </details>
+                <details>
+                    <summary>More options</summary>
+                    <label class="mode-help audio-toggle" style="margin-top:0;">
+                        <input type="checkbox" id="local-play-stun" checked>
+                        Look up my internet address with a public STUN server (needed outside one home network; no game data passes through it)
+                    </label>
+                    <label for="local-play-room" class="mode-help" style="display:block;margin:10px 0 4px;">Same-browser room (for testing with two tabs)</label>
+                    <div class="local-play-row">
+                        <input type="text" id="local-play-room" class="renderer-select" value="default" aria-label="Same-browser room name">
+                        <button type="button" class="btn btn-secondary" id="btn-local-play-tabs">Link tabs</button>
+                    </div>
+                </details>
+                <div class="mode-help" style="margin-top:7px;">
+                    Consoles talk to each other directly; there is no server. Load any save state before linking, then use the game's local wireless menu.
+                </div>
+            </div>
+
+            <div class="card" id="save-state-card" data-widget="save-states">
+                <h2>Save States</h2>
+                <div class="save-toolbar">
+                    <select id="save-state-slot" class="renderer-select" aria-label="Save-state slot">
+                        <option value="1">Slot 1</option>
+                        <option value="2">Slot 2</option>
+                        <option value="3">Slot 3</option>
+                        <option value="4">Slot 4</option>
+                        <option value="5">Slot 5</option>
+                        <option value="6">Slot 6</option>
+                        <option value="7">Slot 7</option>
+                        <option value="8">Slot 8</option>
+                        <option value="9">Slot 9</option>
+                        <option value="10">Slot 10</option>
+                    </select>
+                    <button class="btn btn-success" id="btn-save-state" disabled>Save current game</button>
+                </div>
+                <div id="save-storage-info" class="mode-help">Opening browser storage...</div>
+                <div id="save-state-status" class="mode-help" aria-live="polite"></div>
+                <div id="save-state-list" class="save-list"></div>
+                <div id="save-state-help" class="mode-help" style="margin-top:7px;">
+                    Saves are compressed by Azahar and kept only in this browser. Load the matching ROM before restoring.
+                </div>
+            </div>
+
+            <div class="card" data-widget="log" data-default-span="2">
+                <h2>📋 Log</h2>
+                <div class="log-box" id="log"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ── Shared Game Library (Internet Archive 3DS Romset) ──────── -->
+    <section class="card library-section" id="library-section">
+        <div class="library-header">
+            <div class="library-title-group">
+                <h2>🎮 Shared Game Library</h2>
+                <span class="library-badge" id="library-count-badge">Loading games...</span>
+            </div>
+            <p class="library-subtitle">
+                Search Nintendo 3DS databases on Internet Archive. Compressed archive files must be extracted before loading.
+            </p>
+        </div>
+
+        <div id="library-active-download" class="active-download-card" hidden>
+            <div class="active-download-info">
+                <span id="active-download-title">Downloading Game...</span>
+                <span id="active-download-stats" class="active-download-stats">0%</span>
+            </div>
+            <div class="progress-bar-container">
+                <div id="active-download-bar" class="progress-bar-fill"></div>
+            </div>
+            <div class="active-download-actions">
+                <span id="active-download-speed">Connecting...</span>
+                <button type="button" id="active-download-cancel" class="btn btn-secondary btn-sm">Cancel</button>
+            </div>
+        </div>
+
+        <div id="library-ready" class="ready-card" hidden>
+            <div class="ready-header">✅ Downloaded &amp; ready to play</div>
+            <ul id="library-ready-list" class="ready-list"></ul>
+        </div>
+
+        <div class="library-toolbar">
+            <div class="library-source-controls">
+                <label class="library-source-label" for="library-source">Database:</label>
+                <select id="library-source" class="library-select" aria-label="Game database">
+                    <option value="decrypted">Decrypted 3DS ROM set</option>
+                    <option value="cia">3DS CIA files archive</option>
+                </select>
+                <span class="library-source-label">Internet Archive:</span>
+                <a id="library-source-link" class="library-source-link"
+                   href="https://archive.org/download/3ds-decrypted-roms321com/all/"
+                   target="_blank" rel="noopener">https://archive.org/download/3ds-decrypted-roms321com/all/</a>
+            </div>
+
+            <div class="search-wrap">
+                <input type="text" id="library-search" class="library-input" placeholder="🔍 Search games by title (e.g. Mario, Zelda, Pokemon, Pascal)..." autocomplete="off">
+                <button type="button" id="library-search-clear" class="search-clear-btn" title="Clear search" hidden>×</button>
+            </div>
+
+            <div class="filter-row">
+                <div class="region-filters" id="region-filters">
+                    <button type="button" class="filter-pill active" data-region="all">All</button>
+                    <button type="button" class="filter-pill" data-region="USA">🇺🇸 USA</button>
+                    <button type="button" class="filter-pill" data-region="Europe">🇪🇺 Europe</button>
+                    <button type="button" class="filter-pill" data-region="Japan">🇯🇵 Japan</button>
+                    <button type="button" class="filter-pill" data-region="other">🌐 Other</button>
+                </div>
+
+                <div class="sort-controls">
+                    <label for="library-sort" class="sort-label">Sort:</label>
+                    <select id="library-sort" class="renderer-select library-select">
+                        <option value="title-asc">Title (A → Z)</option>
+                        <option value="title-desc">Title (Z → A)</option>
+                        <option value="size-asc">Size (Smallest)</option>
+                        <option value="size-desc">Size (Largest)</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div class="library-table-container">
+            <table class="library-table" id="library-table">
+                <thead>
+                    <tr>
+                        <th style="width: 50%;">Game Title</th>
+                        <th style="width: 15%;">Region</th>
+                        <th style="width: 15%;">Size</th>
+                        <th style="width: 20%; text-align: right;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="library-list">
+                </tbody>
+            </table>
+            <div id="library-empty" class="library-empty" hidden>No matching games found.</div>
+        </div>
+
+        <div class="library-pagination" id="library-pagination">
+            <button type="button" id="library-prev-page" class="btn btn-secondary btn-sm" disabled>&laquo; Previous</button>
+            <span id="library-page-info" class="page-info">Loading...</span>
+            <button type="button" id="library-next-page" class="btn btn-secondary btn-sm">Next &raquo;</button>
+            <select id="library-page-size" class="library-select page-size-select">
+                <option value="25">25 per page</option>
+                <option value="50" selected>50 per page</option>
+                <option value="100">100 per page</option>
+            </select>
+        </div>
+    </section>
+
+    <script>
+        // Start with the fastest renderer. A fresh-document software mode is
+        // retained for automatic recovery and explicit compatibility use.
+        const softwareMode = new URLSearchParams(location.search).get('renderer') === 'software';
+        window.AzaharWebConfig = softwareMode ?
+            {renderer: 'software', artifact: 'azahar'} :
+            {renderer: 'webgl2', artifact: 'azahar_webgl2',
+             softwareFallbackUrl: 'index.html?renderer=software'};
+    </script>
+    <script src="azahar_savestates.js"></script>
+    <script src="azahar_scheduler.js"></script>
+    <script src="azahar_romfs.js"></script>
+    <script src="azahar_audio.js"></script>
+    <script src="azahar_ui.js"></script>
+    <script src="azahar_input.js"></script>
+    <script src="azahar_fullscreen.js"></script>
+    <script src="azahar_touch_controls.js"></script>
+    <script src="azahar_library.js"></script>
+    <script src="azahar_netplay.js"></script>
+    <script src="azahar_lobbies.js"></script>
+    <script src="azahar_layout.js"></script>
+    <script>
+        document.getElementById('btn-browse-library')?.addEventListener('click', () => {
+            const lib = document.getElementById('library-section');
+            if (lib) {
+                lib.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                document.getElementById('library-search')?.focus();
+            }
+        });
+    </script>
+</body>
+</html>

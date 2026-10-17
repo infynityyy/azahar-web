@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" type="image/svg+xml" href="./app-icon.svg">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azahar WebGL2 Experimental</title>
+    <script>
+        // Legacy entry point: keep old links and benchmark invocations working
+        // while all renderer selection lives in the unified deployment page.
+        const destination = new URL('index.html', location.href);
+        const parameters = new URLSearchParams(location.search);
+        parameters.set('renderer', 'webgl2');
+        destination.search = parameters.toString();
+        location.replace(destination.toString());
+    </script>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; min-height: 100vh; padding: 16px; background: #1a1a2e; color: #e0e0e0;
+               font-family: system-ui, sans-serif; display: grid; place-items: center; }
+        main { width: min(1100px, 100%); display: grid; grid-template-columns: minmax(400px, 1fr) 280px; gap: 16px; }
+        canvas { width: 100%; background: #000; border: 2px solid #0f3460; border-radius: 4px; image-rendering: pixelated; }
+        section { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+        h1 { grid-column: 1 / -1; margin: 0; color: #e94560; font-size: 1.35rem; }
+        h2 { color: #e94560; font-size: 1rem; margin: 0 0 10px; }
+        button, .file-label { width: 100%; display: block; margin: 6px 0; padding: 8px; border: 0; border-radius: 4px;
+                               background: #0f3460; color: #e0e0e0; font-weight: 600; text-align: center; }
+        button:disabled { opacity: .45; }
+        .btn-primary { background: #e94560; color: white; }
+        .btn-success { background: #2d6a4f; color: white; }
+        input[type=file] { display: none; }
+        #status { min-height: 2.2em; font-size: .82rem; color: #aaa; }
+        #status.error { color: #ff8080; } #status.ok { color: #80e080; }
+        #progress { width: 100%; } #fps { font-size: .78rem; color: #aaa; }
+        .log-box { min-height: 110px; max-height: 180px; overflow: auto; padding: 8px; background: #0a0a1a;
+                   font: .7rem ui-monospace, monospace; white-space: pre-wrap; }
+        @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>Azahar WebGL2 — experimental presentation backend</h1>
+        <div>
+            <!-- Do not acquire a 2D context on this canvas. The bootstrap probes
+                 WebGL2 separately, then this exact canvas is claimed once by SDL. -->
+            <canvas id="canvas" width="800" height="480"></canvas>
+            <p><span id="fps"></span></p>
+        </div>
+        <div>
+            <section>
+                <h2>ROM File</h2>
+                <input type="file" id="rom-file" accept=".3ds,.3dsx,.cia,.elf,.cxi,.app,.cci">
+                <label for="rom-file" class="file-label" id="file-label">Choose a 3DS ROM file…</label>
+                <button class="btn-primary" id="btn-load" disabled>Load &amp; Run</button>
+                <div id="status">Checking WebGL2 before starting the emulator…</div>
+                <progress id="progress" max="100" value="0" hidden></progress>
+            </section>
+            <section>
+                <h2>Controls</h2>
+                <button class="btn-primary" id="btn-init" disabled>Initialize Emulator</button>
+                <button class="btn-success" id="btn-step" disabled>Step Frame</button>
+                <button id="btn-run" disabled>Run / Resume</button>
+                <button id="btn-stop" disabled>Stop</button>
+                <button type="button" id="btn-keymap">Keymap</button>
+            </section>
+            <section id="audio-card">
+                <h2>Audio</h2>
+                <button type="button" id="btn-sound" aria-pressed="false">Sound: On</button>
+                <p>
+                    <label for="audio-volume">Volume <output id="audio-volume-value">80%</output></label>
+                    <input id="audio-volume" type="range" min="0" max="100" step="1" value="80" aria-label="Volume">
+                </p>
+                <p>
+                    <label for="audio-latency">Audio buffer (pacing)</label>
+                    <select id="audio-latency" aria-label="Audio buffer">
+                        <option value="50">50 ms — lowest latency</option>
+                        <option value="100">100 ms — balanced</option>
+                        <option value="150">150 ms — fewer dropouts</option>
+                        <option value="200">200 ms — smoothest on slow machines</option>
+                    </select>
+                </p>
+                <label><input type="checkbox" id="audio-stretching" checked> Time stretching when the game runs slow</label>
+                <div id="audio-status" aria-live="polite">Audio starts when a game loads.</div>
+            </section>
+            <section>
+                <h2>Log</h2>
+                <div class="log-box" id="log"></div>
+            </section>
+        </div>
+    </main>
+    <script>
+        window.AzaharWebConfig = {
+            renderer: 'webgl2',
+            artifact: 'azahar_webgl2',
+            // Context/shader/device failure is a page-level fallback. A new
+            // document receives a fresh 2D canvas for the stable artifact.
+            softwareFallbackUrl: 'index.html?renderer=software'
+        };
+    </script>
+    <script src="azahar_romfs.js"></script>
+    <script src="azahar_audio.js"></script>
+    <script src="azahar_ui.js"></script>
+    <script src="azahar_input.js"></script>
+</body>
+</html>
